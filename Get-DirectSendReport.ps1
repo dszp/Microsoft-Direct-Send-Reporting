@@ -49,6 +49,14 @@
     rolling window. The script uses a sliding-window limiter: the first 100 candidates
     process quickly, then pacing kicks in. For 500 candidates, expect ~20 minutes.
 
+    After the rows are emitted, the script prints two console summaries:
+      * Top sources grouped by ProxiedClientHostname, with per-row Category coloring.
+        Use this to identify clusters needing an inbound connector before rollout.
+      * DMARC policy (p= and pct=) per accepted domain, looked up via Resolve-DnsName
+        on Windows or nslookup on macOS/Linux. p=reject or p=quarantine (pct=100) is
+        the safe baseline before enabling Reject Direct Send with shared-cert inbound
+        connectors; p=none undermines the defense-in-depth.
+
 .PARAMETER DelegatedOrganization
     Customer tenant domain or tenant ID for GDAP/CSP delegated connections.
     Omit when connecting directly as Global Admin or Exchange Admin in the target tenant.
