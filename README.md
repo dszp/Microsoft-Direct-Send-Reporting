@@ -25,6 +25,7 @@ PowerShell script to audit emails delivered via Microsoft Direct Send in an Exch
   - [Example: allowlisting a SendGrid-based vendor](#example-allowlisting-a-sendgrid-based-vendor-eg-service-titan)
   - [Example: allowlisting a vendor with a dedicated cert](#example-allowlisting-a-vendor-with-a-dedicated-cert)
   - [Example: allowlisting by IP only](#example-allowlisting-by-ip-only)
+  - [Allowlisting multiple email providers](#allowlisting-multiple-email-providers-sendgrid-mailgun-postmark-etc)
   - [IMPORTANT: DMARC must be enforced](#important-dmarc-must-be-enforced)
   - [Verifying a connector matches correctly](#verifying-a-connector-matches-correctly)
   - [Rollout order](#rollout-order)
@@ -324,6 +325,74 @@ New-InboundConnector `
     -RequireTls $true `
     -Enabled $true
 ```
+
+### Allowlisting multiple email providers (SendGrid, Mailgun, Postmark, etc.)
+
+When multiple transactional providers send mail as your accepted domains, **create one connector per provider**. Multiple connectors sharing the same `-SenderDomains` but different `-TlsSenderCertificateName` values is fine and intended — Exchange evaluates each connector's match criteria independently:
+
+```powershell
+# SendGrid
+New-InboundConnector `
+    -Name 'SendGrid' `
+    -ConnectorType Partner `
+    -SenderDomains 'contoso.com', 'contoso.net' `
+    -TlsSenderCertificateName '*.smtp.sendgrid.net' `
+    -RestrictDomainsToCertificate $true `
+    -RequireTls $true `
+    -CloudServicesMailEnabled $false `
+    -Enabled $true
+
+# Mailgun
+New-InboundConnector `
+    -Name 'Mailgun' `
+    -ConnectorType Partner `
+    -SenderDomains 'contoso.com', 'contoso.net' `
+    -TlsSenderCertificateName '*.mailgun.org' `
+    -RestrictDomainsToCertificate $true `
+    -RequireTls $true `
+    -CloudServicesMailEnabled $false `
+    -Enabled $true
+
+# Postmark
+New-InboundConnector `
+    -Name 'Postmark' `
+    -ConnectorType Partner `
+    -SenderDomains 'contoso.com', 'contoso.net' `
+    -TlsSenderCertificateName '*.postmarkapp.com' `
+    -RestrictDomainsToCertificate $true `
+    -RequireTls $true `
+    -CloudServicesMailEnabled $false `
+    -Enabled $true
+
+# Amazon SES
+New-InboundConnector `
+    -Name 'Amazon SES' `
+    -ConnectorType Partner `
+    -SenderDomains 'contoso.com', 'contoso.net' `
+    -TlsSenderCertificateName '*.amazonses.com' `
+    -RestrictDomainsToCertificate $true `
+    -RequireTls $true `
+    -CloudServicesMailEnabled $false `
+    -Enabled $true
+```
+
+**The cert subjects above are educated guesses based on common patterns. Verify each one live before creating the connector** using the `openssl s_client` command from [Finding a vendor's TLS certificate subject](#finding-a-vendors-tls-certificate-subject), targeted at each provider's SMTP endpoint (`smtp.mailgun.org`, `smtp.postmarkapp.com`, `email-smtp.<region>.amazonaws.com`, etc.).
+
+**Shared infrastructure matters.** When two different application vendors both use SendGrid (e.g., FieldOps + a CRM + a scheduling tool), they share the same cert and match the same SendGrid connector. One SendGrid connector covers them all — it doesn't need to know which downstream SaaS is using SendGrid. The security implication is that the SendGrid connector effectively allowlists *any* SendGrid customer sending as your domains; the [DMARC enforcement](#important-dmarc-must-be-enforced) requirement is what blocks other SendGrid customers from spoofing you through the allowlisted path.
+
+**When the cert approach doesn't cleanly work.** Some providers rotate through many cert subjects, use a CDN/edge layer with a generic cert unrelated to the vendor brand, or deliver via multiple services. In those cases, fall back to `-SenderIPAddresses` with the vendor's documented CIDR blocks, or combine both cert and IP on the same connector (the match is OR, not AND — either condition matching is sufficient).
+
+**Identifying which providers you need.** Run the audit — the source summary's `AnonymousExternal` rows show you who's sending. The hostname domain usually reveals the provider:
+
+```
+o21.ptrNNNN.sendgrid.<appvendor>.com  → SendGrid
+m1234.mailgun.net                     → Mailgun
+pm.mtasv.net                          → Postmark
+mail-xx.amazonses.com                 → Amazon SES
+us2-emailsignatures-cloud.codetwo.com → CodeTwo signature service
+```
+
+One connector per real-service cluster. `SpamLikely` clusters stay unallowlisted — Reject Direct Send blocks them correctly.
 
 ### IMPORTANT: DMARC must be enforced
 
