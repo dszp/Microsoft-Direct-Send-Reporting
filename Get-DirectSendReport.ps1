@@ -1,0 +1,759 @@
+#Requires -Modules ExchangeOnlineManagement
+
+<#
+.SYNOPSIS
+    Reports Direct Send traffic that would be blocked if "Reject Direct Send" is enabled.
+
+.DESCRIPTION
+    Default behavior: list every message that would be blocked by Microsoft's "Reject
+    Direct Send" feature -- i.e., anonymous SMTP deliveries to the tenant MX with a
+    sender in an accepted domain and a recipient in an accepted domain, where EOP
+    did not attribute the connection to a configured inbound connector AND logged it
+    as an anonymous connection (ProxiedClientHostname is populated).
+
+    This is the audit view for planning a "Reject Direct Send" rollout: most entries
+    are spam, but any legitimate traffic here needs to be allowlisted (via an inbound
+    connector with an IP restriction) before Reject Direct Send is turned on globally,
+    or the legitimate traffic will be blocked along with the spam.
+
+    Filtering pipeline (all four pass = message is in the report by default):
+      1. ConnectorId is the "\Default " pattern in the Detail event XML -- no custom
+         inbound connector matched. This is Microsoft's authoritative Direct Send
+         signal, taken from the Get-MessageTraceDetailV2 Receive event's Data blob.
+      2. FromIP is populated -- the message came from an external SMTP connection
+         (authenticated internal email has no FromIP).
+      3. Sender and recipient domains are both accepted domains for the tenant.
+      4. ProxiedClientHostname is populated -- EOP treated the connection as
+         anonymous inbound. Empty ProxiedClientHostname means EOP classified the
+         traffic differently (typically an on-prem/hybrid relay that Reject Direct
+         Send does NOT affect; see -IncludeInternalRelay to see those).
+
+    Output includes a Category column:
+      SpamLikely        - ProxiedClientHostname is a bracketed IP like [127.0.0.1].
+                          Signature of a spammer providing no valid HELO hostname.
+      AnonymousExternal - A real hostname (legitimate mail service or sophisticated
+                          spam). Worth a closer look before allowlisting.
+
+    With -IncludeInternalRelay, a third category appears:
+      InternalRelay     - ProxiedClientHostname is empty. EOP did not classify the
+                          connection as anonymous inbound, so Reject Direct Send will
+                          NOT affect it. Typically on-prem Exchange hybrid relays or
+                          authenticated paths that share the default connector route
+                          but are not the Direct Send abuse surface.
+
+    Coverage: up to 90 days. Ranges over 10 days are auto-chunked (V2 limit: 10 days).
+
+    Minimum required role: Exchange Administrator (GDAP or direct) or Global Admin.
+
+    Rate limits: Get-MessageTraceDetailV2 is throttled to 100 requests per 5-minute
+    rolling window. The script uses a sliding-window limiter: the first 100 candidates
+    process quickly, then pacing kicks in. For 500 candidates, expect ~20 minutes.
+
+.PARAMETER DelegatedOrganization
+    Customer tenant domain or tenant ID for GDAP/CSP delegated connections.
+    Omit when connecting directly as Global Admin or Exchange Admin in the target tenant.
+
+.PARAMETER Days
+    Number of days back from today to search. Range: 1-90. Default: 10.
+    Values over 10 are automatically split into 10-day query windows.
+
+.PARAMETER OutputPath
+    Optional path for CSV export. If omitted, results are written to the pipeline/console.
+
+.PARAMETER AcceptedDomains
+    Override the auto-detected accepted domain list. If omitted, the script calls
+    Get-AcceptedDomain to retrieve them. Useful when access is restricted or you want
+    to limit the search to specific domains only.
+
+.PARAMETER NewSession
+    Disconnect any existing Exchange Online session before connecting. Use this when
+    you need to authenticate with different credentials than the current session.
+
+.PARAMETER ShowSchema
+    Diagnostic mode. Connects, queries one recent message, and dumps the full property
+    list from Get-MessageTraceV2 and Get-MessageTraceDetailV2 so you can inspect what
+    fields are actually available in your tenant. Exits without running the audit.
+
+.PARAMETER IncludeInternalRelay
+    Also include rows where EOP did not classify the connection as anonymous inbound
+    (empty ProxiedClientHostname). These messages hit the default connector route but
+    Reject Direct Send does NOT affect them. Use when investigating all traffic on
+    the default connector path -- for example, to find an on-prem relay that should
+    be formalized with a named inbound connector.
+
+.PARAMETER NoDeepInspect
+    Skip the per-candidate Get-MessageTraceDetailV2 lookup. This avoids the rate-limit
+    delay but loses the authoritative ConnectorId check, the ProxiedClientHostname-
+    based categorization, and the SCL score. Results then rely on the primary trace's
+    FromIP + accepted-domain filters alone, which cannot distinguish Reject-Direct-
+    Send-affected traffic from other default-connector traffic.
+
+    Use for fast prototyping over large date ranges or when you already know the
+    result set from a prior deep-inspection run.
+
+.EXAMPLE
+    # Default: see what would be blocked by Reject Direct Send over the last 10 days
+    .\Get-DirectSendReport.ps1 -OutputPath .\DirectSend.csv
+
+.EXAMPLE
+    # GDAP / CSP partner, 30-day audit of a customer tenant
+    .\Get-DirectSendReport.ps1 -DelegatedOrganization contoso.onmicrosoft.com -Days 30 -OutputPath .\contoso.csv
+
+.EXAMPLE
+    # Include default-connector traffic that Reject Direct Send wouldn't affect
+    # (useful for finding on-prem relays that should have a named inbound connector)
+    .\Get-DirectSendReport.ps1 -Days 30 -IncludeInternalRelay
+
+.EXAMPLE
+    # Fast mode: skip per-message detail calls. Broader result set, less accurate.
+    .\Get-DirectSendReport.ps1 -Days 90 -NoDeepInspect
+
+.EXAMPLE
+    # Diagnose what fields are available in this tenant's message trace output
+    .\Get-DirectSendReport.ps1 -ShowSchema
+
+.NOTES
+    To diagnose output schema, run this after connecting:
+      Get-MessageTraceV2 -ResultSize 1 | Format-List *
+
+    The authoritative ConnectorId field for Direct Send lives inside the
+    Get-MessageTraceDetailV2 Receive event's Data XML (not on the summary record).
+    It matches the pattern "<server>\Default <server>" when no configured inbound
+    connector matched -- that's the Direct Send path per Microsoft's Reject Direct
+    Send documentation.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [string]$DelegatedOrganization,
+
+    [Parameter()]
+    [ValidateRange(1, 90)]
+    [int]$Days = 10,
+
+    [Parameter()]
+    [string]$OutputPath,
+
+    [Parameter()]
+    [string[]]$AcceptedDomains,
+
+    [Parameter()]
+    [switch]$NewSession,
+
+    [Parameter()]
+    [switch]$ShowSchema,
+
+    [Parameter()]
+    [switch]$IncludeInternalRelay,
+
+    [Parameter()]
+    [switch]$NoDeepInspect
+)
+
+$ErrorActionPreference = 'Stop'
+
+#region Helper: DMARC record lookup
+
+# Cross-platform DMARC lookup. Tries Resolve-DnsName (Windows) first, then falls
+# back to nslookup (everywhere). Returns an object with Policy ('none' | 'quarantine'
+# | 'reject' | 'no record' | 'unparseable'), Pct (int, defaults to 100 per spec),
+# and the raw Record text.
+function Get-DmarcInfo {
+    param([Parameter(Mandatory)][string]$Domain)
+
+    $result = [PSCustomObject]@{
+        Domain = $Domain
+        Policy = 'no record'
+        Pct    = $null
+        Record = $null
+    }
+
+    $record = $null
+
+    if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
+        try {
+            $txtRecords = Resolve-DnsName -Name "_dmarc.$Domain" -Type TXT -ErrorAction Stop
+            foreach ($r in $txtRecords) {
+                $full = if ($r.Strings) { $r.Strings -join '' } elseif ($r.Text) { $r.Text } else { '' }
+                if ($full -match '^v=DMARC1') { $record = $full; break }
+            }
+        } catch { }
+    }
+
+    if (-not $record) {
+        try {
+            $output = & nslookup -type=TXT "_dmarc.$Domain" 2>$null | Out-String
+            if ($output -match '"(v=DMARC1[^"]*)"') {
+                $record = $Matches[1]
+            } elseif ($output -match '(v=DMARC1[^\r\n]*)') {
+                $record = $Matches[1]
+            }
+        } catch { }
+    }
+
+    if ($record) {
+        $result.Record = $record
+        if ($record -match 'p\s*=\s*(none|quarantine|reject)') {
+            $result.Policy = $Matches[1].ToLower()
+        } else {
+            $result.Policy = 'unparseable'
+        }
+        if ($record -match 'pct\s*=\s*(\d+)') {
+            $result.Pct = [int]$Matches[1]
+        } else {
+            $result.Pct = 100
+        }
+    }
+
+    return $result
+}
+
+#endregion
+
+#region Connection
+
+# Warn if the module version is too old for reliable macOS/Linux support.
+# REST-based cmdlets (no WSMan required) became the default in v3.2.0.
+$installedModule = Get-Module ExchangeOnlineManagement -ListAvailable |
+    Sort-Object Version -Descending | Select-Object -First 1
+if ($installedModule -and $installedModule.Version -lt [Version]'3.2.0') {
+    Write-Warning "ExchangeOnlineManagement v$($installedModule.Version) detected. v3.2.0 or later is required on macOS/Linux."
+    Write-Warning 'Run: Install-Module ExchangeOnlineManagement -Force -AllowClobber -Scope CurrentUser'
+}
+
+$connectParams = @{ ShowBanner = $false }
+if ($DelegatedOrganization) {
+    $connectParams['DelegatedOrganization'] = $DelegatedOrganization
+}
+
+# UseRPSSession:$false forces REST-based auth (no WSMan/WinRM) on all platforms.
+# The parameter exists in v3.0-3.3; removed in v3.4+ where REST is the only mode.
+# Without this, older module versions default to WSMan which is unavailable on macOS/Linux.
+$exoCmd = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
+if ($exoCmd -and $exoCmd.Parameters.ContainsKey('UseRPSSession')) {
+    $connectParams['UseRPSSession'] = $false
+}
+
+$existingConnection = $null
+try {
+    # Get-ConnectionInformation was added in ExchangeOnlineManagement v3.0
+    $existingConnection = Get-ConnectionInformation -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -eq 'Connected' } |
+        Select-Object -First 1
+} catch { }
+
+if ($NewSession -and $existingConnection) {
+    Write-Host "Disconnecting existing session ($($existingConnection.Organization)) for fresh login..." -ForegroundColor Cyan
+    Disconnect-ExchangeOnline -Confirm:$false
+    $existingConnection = $null
+}
+
+if (-not $existingConnection) {
+    Write-Host 'Connecting to Exchange Online...' -ForegroundColor Cyan
+    Connect-ExchangeOnline @connectParams
+} elseif ($DelegatedOrganization -and $existingConnection.Organization -notlike "*$DelegatedOrganization*") {
+    Write-Warning "Current session is '$($existingConnection.Organization)' but '$DelegatedOrganization' was requested. Reconnecting."
+    Disconnect-ExchangeOnline -Confirm:$false
+    Connect-ExchangeOnline @connectParams
+} else {
+    Write-Host "Using existing Exchange Online session: $($existingConnection.Organization)" -ForegroundColor Cyan
+}
+
+#endregion
+
+#region Diagnostic schema dump
+
+if ($ShowSchema) {
+    $bar = '=' * 70
+    Write-Host ''
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host 'SCHEMA DIAGNOSTIC MODE' -ForegroundColor Cyan
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host ''
+
+    # Find one message to inspect -- try last 48h, then expand to 7 days if nothing found
+    $sample = Get-MessageTraceV2 -StartDate (Get-Date).AddHours(-48) -EndDate (Get-Date) -ResultSize 1
+    if (-not $sample) {
+        Write-Host 'No messages in last 48h, expanding to 7 days...' -ForegroundColor Gray
+        $sample = Get-MessageTraceV2 -StartDate (Get-Date).AddDays(-7) -EndDate (Get-Date) -ResultSize 1
+    }
+    if (-not $sample) {
+        throw 'No messages found in the last 7 days. Cannot inspect schema.'
+    }
+
+    Write-Host '--- Get-MessageTraceV2 output (one record) ---' -ForegroundColor Yellow
+    $sample | Format-List *
+    Write-Host ''
+
+    Write-Host '--- Property names only ---' -ForegroundColor Yellow
+    ($sample | Select-Object -First 1).PSObject.Properties | ForEach-Object {
+        '{0,-30} {1}' -f $_.Name, $_.TypeNameOfValue
+    }
+    Write-Host ''
+
+    # Now pull the detail events for the same message
+    Write-Host '--- Get-MessageTraceDetailV2 events (all events for this message) ---' -ForegroundColor Yellow
+    $traceId = $sample.MessageTraceId
+    $recipient = $sample.RecipientAddress
+    Write-Host "MessageTraceId   : $traceId" -ForegroundColor Gray
+    Write-Host "RecipientAddress : $recipient" -ForegroundColor Gray
+    Write-Host ''
+
+    $details = Get-MessageTraceDetailV2 -MessageTraceId $traceId -RecipientAddress $recipient
+    if (-not $details) {
+        Write-Warning 'Get-MessageTraceDetailV2 returned no results for this message.'
+    } else {
+        $details | Format-List *
+
+        Write-Host ''
+        Write-Host '--- Detail event property names only ---' -ForegroundColor Yellow
+        ($details | Select-Object -First 1).PSObject.Properties | ForEach-Object {
+            '{0,-30} {1}' -f $_.Name, $_.TypeNameOfValue
+        }
+    }
+
+    Write-Host ''
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host 'Diagnostic complete. Share the output above to identify usable fields.' -ForegroundColor Cyan
+    Write-Host $bar -ForegroundColor Cyan
+    return
+}
+
+#endregion
+
+#region Schema detection
+# Get-MessageTraceV2 output properties are not documented; discover them from a live record
+# before committing to property names that drive the filter and pagination logic.
+
+Write-Host 'Detecting Get-MessageTraceV2 output schema...' -ForegroundColor Cyan
+
+$schemaRecord = Get-MessageTraceV2 -StartDate (Get-Date).AddHours(-24) -EndDate (Get-Date) -ResultSize 1
+
+$connectorPropName = $null
+$receivedPropName  = $null
+
+if ($schemaRecord) {
+    $props = ($schemaRecord | Select-Object -First 1).PSObject.Properties.Name
+    Write-Verbose "Discovered properties: $($props -join ', ')"
+
+    # Connector property -- blank for Direct Send, populated for authenticated/relay
+    $connectorPropName = $props | Where-Object { $_ -match '(?i)connector' } | Select-Object -First 1
+
+    # Received timestamp -- used for pagination (EndDate = last record's received time)
+    $receivedPropName = $props | Where-Object { $_ -match '(?i)received' } | Select-Object -First 1
+}
+
+if (-not $connectorPropName) {
+    Write-Warning @'
+No connector-related property found in Get-MessageTraceV2 output.
+Run this to inspect available properties:
+  Get-MessageTraceV2 -ResultSize 1 | Format-List *
+
+Results will be filtered by accepted sender domain only (connector filter not applied).
+This may include non-Direct-Send messages. Verify your results manually.
+'@
+} else {
+    Write-Host "Connector filter property : $connectorPropName" -ForegroundColor Cyan
+}
+
+if (-not $receivedPropName) {
+    if (-not $schemaRecord) {
+        Write-Warning 'No messages found in last 24h for schema detection. Assuming property names: Received, ConnectorId.'
+        $receivedPropName  = 'Received'
+        $connectorPropName = $connectorPropName ?? 'ConnectorId'
+    } else {
+        throw @"
+No received-timestamp property found in output.
+Run: Get-MessageTraceV2 -ResultSize 1 | Format-List *
+to identify the correct property, then pass it to the script.
+"@
+    }
+} else {
+    Write-Host "Received timestamp property: $receivedPropName" -ForegroundColor Cyan
+}
+
+#endregion
+
+#region Accepted domains
+
+if ($PSBoundParameters.ContainsKey('AcceptedDomains') -and $AcceptedDomains.Count -gt 0) {
+    $domainSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($d in $AcceptedDomains) {
+        $null = $domainSet.Add($d.TrimStart('@').ToLower())
+    }
+    Write-Host "Using provided accepted domains: $($domainSet -join ', ')" -ForegroundColor Cyan
+} else {
+    Write-Host 'Detecting accepted domains...' -ForegroundColor Cyan
+    $domainSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    Get-AcceptedDomain | ForEach-Object { $null = $domainSet.Add($_.DomainName.ToLower()) }
+    Write-Host "Found $($domainSet.Count) accepted domain(s): $($domainSet -join ', ')" -ForegroundColor Cyan
+}
+
+if ($domainSet.Count -eq 0) {
+    throw 'No accepted domains found or provided. Use -AcceptedDomains to specify them manually.'
+}
+
+#endregion
+
+#region Build 10-day query windows (newest first)
+
+$now        = Get-Date
+$rangeEnd   = $now.Date.AddDays(1).AddSeconds(-1)   # 23:59:59 today
+$rangeStart = $now.Date.AddDays(-$Days)
+
+$chunks = [System.Collections.Generic.List[hashtable]]::new()
+$windowEnd = $rangeEnd
+while ($windowEnd -gt $rangeStart) {
+    $windowStart = $windowEnd.Date.AddDays(-9)       # 10 calendar days per window
+    if ($windowStart -lt $rangeStart) { $windowStart = $rangeStart }
+    $chunks.Add(@{ Start = $windowStart; End = $windowEnd })
+    $windowEnd = $windowStart.AddSeconds(-1)
+}
+
+Write-Host "Searching $Days day(s) across $($chunks.Count) query window(s)..." -ForegroundColor Cyan
+
+#endregion
+
+#region Query and filter
+
+$allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+$seenIds    = [System.Collections.Generic.HashSet[string]]::new()
+$chunkNum   = 0
+
+foreach ($chunk in $chunks) {
+    $chunkNum++
+    Write-Host "  [$chunkNum/$($chunks.Count)] $($chunk.Start.ToString('yyyy-MM-dd')) to $($chunk.End.ToString('yyyy-MM-dd'))" -ForegroundColor Gray
+
+    $chunkWindowEnd    = $chunk.End
+    $startingRecipient = $null
+
+    do {
+        $queryParams = @{
+            StartDate  = $chunk.Start
+            EndDate    = $chunkWindowEnd
+            ResultSize = 5000
+        }
+        # Pagination: per docs, use StartingRecipientAddress + updated EndDate (last record's received time)
+        if ($startingRecipient) {
+            $queryParams['StartingRecipientAddress'] = $startingRecipient
+        }
+
+        $batch = @(Get-MessageTraceV2 @queryParams)
+
+        foreach ($msg in $batch) {
+            # Filter 1: no connector = unauthenticated path (Direct Send via MX)
+            # Skip filter 1 if connector property wasn't found in schema detection
+            $passesConnectorFilter = (-not $connectorPropName) -or [string]::IsNullOrEmpty($msg.$connectorPropName)
+            if (-not $passesConnectorFilter) { continue }
+
+            # Filter 2: FromIP must be non-empty
+            # Authenticated internal email (OWA, Outlook, MAPI) has no external SMTP source,
+            # so FromIP is blank in the trace. Direct Send always has a source IP because the
+            # device physically opened a TCP/SMTP connection to the MX endpoint.
+            # This is what excludes legitimate internal emails from the results after
+            # Direct Send is disabled -- they share blank ConnectorId but have no FromIP.
+            if ([string]::IsNullOrEmpty($msg.FromIP)) { continue }
+
+            $senderDomain = if ($msg.SenderAddress -match '@(.+)$') { $Matches[1].ToLower() } else { '' }
+            $recipientDomain = if ($msg.RecipientAddress -match '@(.+)$') { $Matches[1].ToLower() } else { '' }
+
+            # Filter 3: sender must claim an accepted domain
+            # Filter 4: recipient must also be an accepted domain
+            # Direct Send arrives at the tenant MX and delivers to an INTERNAL mailbox.
+            # External recipients cannot receive via Direct Send -- the device would send
+            # to their MX directly, not through this tenant's MX first.
+            if (-not ($senderDomain -and $domainSet.Contains($senderDomain))) { continue }
+            if (-not ($recipientDomain -and $domainSet.Contains($recipientDomain))) { continue }
+
+            $traceId = $msg.MessageTraceId.ToString()
+            if ($seenIds.Add($traceId)) {
+                $allResults.Add([PSCustomObject]@{
+                    DateTime = $msg.$receivedPropName
+                    From = $msg.SenderAddress
+                    To = $msg.RecipientAddress
+                    Subject = $msg.Subject
+                    Status = $msg.Status
+                    FromIP = $msg.FromIP
+                    MessageTraceId = $traceId
+                })
+            }
+        }
+
+        # Pagination: if full page returned, advance window using last record's values
+        if ($batch.Count -eq 5000) {
+            $last              = $batch | Select-Object -Last 1
+            $chunkWindowEnd    = $last.$receivedPropName
+            $startingRecipient = $last.RecipientAddress
+        }
+
+    } while ($batch.Count -eq 5000)
+
+    # Brief pause between chunks -- rate limit is 100 requests per 5-minute window
+    if ($chunkNum -lt $chunks.Count) {
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+#endregion
+
+#region Deep inspection (authoritative ConnectorId from Detail event Data XML)
+
+if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
+    Write-Host ''
+    Write-Host "Deep inspection: pulling detail events for $($allResults.Count) candidate(s)..." -ForegroundColor Cyan
+    Write-Host 'Rate-limited to 100 requests per 5 minutes. Sliding-window pacing.' -ForegroundColor Gray
+
+    $deepResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $excludedCustomConnector = 0
+    $excludedInternalRelay = 0
+
+    # Sliding-window rate limiter: 100 requests per 300 seconds.
+    # Track timestamps of every detail call; before each new call, purge timestamps
+    # older than 5 minutes, and if we're still at 100, wait until the oldest slides
+    # out of the window. This lets the first 100 burst through, then paces after.
+    $windowSize = 100
+    $windowSeconds = 300
+    $requestTimes = [System.Collections.Generic.Queue[DateTime]]::new()
+
+    for ($i = 0; $i -lt $allResults.Count; $i++) {
+        $record = $allResults[$i]
+        $pct = [int](($i / $allResults.Count) * 100)
+        Write-Progress -Activity 'Deep inspection' -Status "$($i + 1) / $($allResults.Count) -- kept $($deepResults.Count)" -PercentComplete $pct
+
+        # Sliding-window rate limit: purge expired, wait if at capacity
+        $now = Get-Date
+        while ($requestTimes.Count -gt 0 -and ($now - $requestTimes.Peek()).TotalSeconds -gt $windowSeconds) {
+            [void]$requestTimes.Dequeue()
+        }
+        if ($requestTimes.Count -ge $windowSize) {
+            $waitSeconds = [Math]::Ceiling($windowSeconds - ($now - $requestTimes.Peek()).TotalSeconds) + 2
+            Write-Progress -Activity 'Deep inspection' -Status "Rate limit: waiting ${waitSeconds}s (at request $($i + 1) / $($allResults.Count))" -PercentComplete $pct
+            Start-Sleep -Seconds $waitSeconds
+            [void]$requestTimes.Dequeue()
+        }
+        $requestTimes.Enqueue((Get-Date))
+
+        $connectorId = ''
+        $proxiedClientIP = ''
+        $proxiedClientHostname = ''
+        $scl = $null
+        $events = @()
+
+        # Retry once on throttle with a 60s cooldown before giving up on this record
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $events = @(Get-MessageTraceDetailV2 -MessageTraceId $record.MessageTraceId -RecipientAddress $record.To -ErrorAction Stop)
+                break
+            } catch {
+                if ($_.Exception.Message -match 'surpassed the permitted limit' -and $attempt -eq 1) {
+                    Write-Progress -Activity 'Deep inspection' -Status "Throttled at request $($i + 1); cooling down 60s" -PercentComplete $pct
+                    Start-Sleep -Seconds 60
+                    $requestTimes.Clear()
+                    $requestTimes.Enqueue((Get-Date))
+                    continue
+                }
+                Write-Warning "Detail lookup failed for $($record.MessageTraceId): $($_.Exception.Message)"
+                break
+            }
+        }
+
+        # Parse Receive event Data XML for ConnectorId and CustomData blob
+        $receive = $events | Where-Object { $_.Event -eq 'Receive' } | Select-Object -First 1
+        if ($receive -and $receive.Data) {
+            try {
+                $xml = [xml]$receive.Data
+                foreach ($mep in $xml.root.MEP) {
+                    switch ($mep.Name) {
+                        'ConnectorId' { $connectorId = [string]$mep.String }
+                        'CustomData' {
+                            $blob = [string]$mep.Blob
+                            if ($blob -match 'ProxiedClientIPAddress=([^;]+)') { $proxiedClientIP = $Matches[1] }
+                            if ($blob -match 'ProxiedClientHostname=([^;]+)') { $proxiedClientHostname = $Matches[1] }
+                        }
+                    }
+                }
+            } catch {
+                Write-Verbose "Failed to parse Receive Data XML for $($record.MessageTraceId): $_"
+            }
+        }
+
+        # Parse Spam event for SCL if present (only for flagged messages)
+        $spamEvent = $events | Where-Object { $_.Event -eq 'Spam' } | Select-Object -First 1
+        if ($spamEvent -and $spamEvent.Data) {
+            try {
+                $xml = [xml]$spamEvent.Data
+                $sclMep = $xml.root.MEP | Where-Object { $_.Name -eq 'SCL' } | Select-Object -First 1
+                if ($sclMep) { $scl = [int]$sclMep.Integer }
+            } catch {
+                Write-Verbose "Failed to parse Spam Data XML for $($record.MessageTraceId): $_"
+            }
+        }
+
+        # Authoritative filter: the "\Default " pattern in ConnectorId means no configured
+        # inbound connector matched -- this is the Direct Send / anonymous MX path per
+        # Microsoft's Reject Direct Send documentation. Custom connector (CodeTwo, hybrid,
+        # partner relay) names don't contain this pattern and are excluded here.
+        if ($connectorId -and $connectorId -notmatch '\\Default\s') {
+            $excludedCustomConnector++
+            continue
+        }
+
+        # Classify based on ProxiedClientHostname pattern.
+        # Anonymous external SMTP connections leave EOP logging a "proxied client"
+        # hostname. Spammers rarely provide a valid HELO hostname, so EOP records
+        # the source IP in brackets -- the "[127.0.0.1]" / "[<ip>]" pattern is the
+        # signature of Direct Send spam. Normal hostnames (google.com, etc.) are
+        # plausible for legitimate external mail services. Empty means EOP did
+        # not treat this as anonymous inbound -- typically an on-prem/hybrid
+        # relay that Reject Direct Send does NOT affect.
+        $category = if ($proxiedClientHostname -match '^\[.+\]$') { 'SpamLikely' }
+                    elseif ($proxiedClientHostname) { 'AnonymousExternal' }
+                    else { 'InternalRelay' }
+
+        # Default: exclude InternalRelay (not affected by Reject Direct Send).
+        # Pass -IncludeInternalRelay to see it.
+        if ($category -eq 'InternalRelay' -and -not $IncludeInternalRelay) {
+            $excludedInternalRelay++
+            continue
+        }
+
+        $deepResults.Add([PSCustomObject]@{
+            DateTime = $record.DateTime
+            From = $record.From
+            To = $record.To
+            Subject = $record.Subject
+            Status = $record.Status
+            Category = $category
+            FromIP = $record.FromIP
+            ConnectorId = $connectorId
+            ProxiedClientIP = $proxiedClientIP
+            ProxiedClientHostname = $proxiedClientHostname
+            SCL = $scl
+            MessageTraceId = $record.MessageTraceId
+        })
+    }
+
+    Write-Progress -Activity 'Deep inspection' -Completed
+    Write-Host "  Inspected $($allResults.Count); excluded $excludedCustomConnector via custom connector, $excludedInternalRelay internal relay; kept $($deepResults.Count)." -ForegroundColor Cyan
+
+    $allResults = $deepResults
+}
+
+#endregion
+
+#region Output
+
+$results = $allResults | Sort-Object DateTime -Descending
+
+$bar = '=' * 54
+Write-Host ''
+Write-Host $bar -ForegroundColor Cyan
+if ($connectorPropName) {
+    Write-Host "Direct Send messages found : $($results.Count)"    -ForegroundColor $(if ($results.Count -gt 0) { 'Yellow' } else { 'Green' })
+} else {
+    Write-Host "Domain-matched messages    : $($results.Count) (connector filter not applied -- see warnings above)" -ForegroundColor Yellow
+}
+Write-Host "Date range (UTC)           : $($rangeStart.ToString('yyyy-MM-dd')) to $($now.ToString('yyyy-MM-dd'))"
+Write-Host "Accepted domains searched  : $($domainSet -join ', ')"
+Write-Host $bar -ForegroundColor Cyan
+
+# Source summary -- group by ProxiedClientHostname so the user can see
+# at a glance which IPs/hostnames account for the traffic. This is the
+# key view for planning a Reject Direct Send rollout: clusters of the
+# same hostname on legitimate-looking entries usually indicate a service
+# that needs an inbound connector before cutover (CodeTwo, on-prem
+# relay, transactional mail provider, etc.).
+if ($results.Count -gt 0 -and ($results | Get-Member -Name ProxiedClientHostname -ErrorAction SilentlyContinue)) {
+    Write-Host ''
+    Write-Host 'Top sources (ProxiedClientHostname):' -ForegroundColor Cyan
+
+    $grouped = $results | ForEach-Object {
+        # Flatten each row to (hostname, category) so groups are one row per hostname.
+        # Blank hostnames show as "<empty>" for visibility.
+        [PSCustomObject]@{
+            Hostname = if ([string]::IsNullOrEmpty($_.ProxiedClientHostname)) { '<empty>' } else { $_.ProxiedClientHostname }
+            Category = $_.Category
+        }
+    } | Group-Object Hostname | Sort-Object Count -Descending
+
+    # Compute the longest hostname length for padding. Measure-Object -Maximum on
+    # string properties is version-sensitive, so compute directly with Select-Object.
+    $longestHost = 0
+    foreach ($g in $grouped) {
+        if ($g.Name.Length -gt $longestHost) { $longestHost = $g.Name.Length }
+    }
+    $colWidth = [Math]::Max(20, [Math]::Min(48, $longestHost))
+
+    foreach ($g in $grouped) {
+        $category = ($g.Group | Select-Object -First 1).Category
+        $color = switch ($category) {
+            'SpamLikely'        { 'Red' }
+            'AnonymousExternal' { 'Yellow' }
+            'InternalRelay'     { 'Gray' }
+            default             { 'White' }
+        }
+        $hostDisplay = if ($g.Name.Length -gt $colWidth) { $g.Name.Substring(0, $colWidth - 1) + '…' } else { $g.Name }
+        $padded = $hostDisplay.PadRight($colWidth)
+        $countStr = $g.Count.ToString().PadLeft(5)
+        Write-Host "  $padded  $countStr  $category" -ForegroundColor $color
+    }
+
+    Write-Host ''
+    Write-Host 'Color key: Red = SpamLikely, Yellow = AnonymousExternal, Gray = InternalRelay' -ForegroundColor DarkGray
+    Write-Host 'Clusters of the same AnonymousExternal hostname often represent a legitimate' -ForegroundColor DarkGray
+    Write-Host 'service (signature platform, relay, transactional mail) that will be blocked by' -ForegroundColor DarkGray
+    Write-Host 'Reject Direct Send unless an inbound connector is configured with its IPs.' -ForegroundColor DarkGray
+    Write-Host $bar -ForegroundColor Cyan
+}
+
+# DMARC policy check per accepted domain. When Reject Direct Send is enabled with
+# shared-certificate connectors (e.g., *.smtp.sendgrid.net), defense-in-depth
+# depends on DMARC enforcement -- p=none undermines the approach because auth
+# failures aren't acted on, letting any tenant of the shared service potentially
+# spoof accepted domains through the allowlisted path.
+Write-Host ''
+Write-Host 'DMARC policy per accepted domain:' -ForegroundColor Cyan
+
+$domainColWidth = 0
+foreach ($d in $domainSet) {
+    if ($d.Length -gt $domainColWidth) { $domainColWidth = $d.Length }
+}
+if ($domainColWidth -lt 20) { $domainColWidth = 20 }
+
+foreach ($domain in ($domainSet | Sort-Object)) {
+    $info = Get-DmarcInfo -Domain $domain
+
+    $color = switch ($info.Policy) {
+        'reject' { 'Green' }
+        'quarantine' { if ($info.Pct -lt 100) { 'Yellow' } else { 'Green' } }
+        'none' { 'Red' }
+        'no record' { 'Red' }
+        default { 'Gray' }
+    }
+
+    $policyDisplay = "p=$($info.Policy)"
+    if ($info.Policy -in @('none', 'quarantine', 'reject') -and $info.Pct -lt 100) {
+        $policyDisplay += " (pct=$($info.Pct))"
+    }
+
+    $padded = $domain.PadRight($domainColWidth)
+    Write-Host "  $padded  $policyDisplay" -ForegroundColor $color
+}
+
+Write-Host ''
+Write-Host 'DMARC guidance:' -ForegroundColor DarkGray
+Write-Host '  p=reject or p=quarantine (pct=100) is the safe baseline before enabling' -ForegroundColor DarkGray
+Write-Host '  Reject Direct Send with shared-cert inbound connectors. p=none means auth' -ForegroundColor DarkGray
+Write-Host '  failures are NOT acted on and an allowlisted shared cert could be abused.' -ForegroundColor DarkGray
+Write-Host $bar -ForegroundColor Cyan
+
+if ($OutputPath) {
+    $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+    $resolved = if (Test-Path $OutputPath) { (Resolve-Path $OutputPath).Path } else { $OutputPath }
+    Write-Host "Results exported to: $resolved" -ForegroundColor Green
+}
+
+$results
+
+#endregion
