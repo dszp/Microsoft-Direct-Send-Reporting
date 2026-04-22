@@ -35,6 +35,7 @@ PowerShell script to audit emails delivered via Microsoft Direct Send in an Exch
 - [Why the Detail Lookup Sometimes Returns Nothing](#why-the-detail-lookup-sometimes-returns-nothing)
 - [Further Investigation](#further-investigation)
 - [Alternative: Historical Search (Async, Fully Documented)](#alternative-historical-search-async-fully-documented)
+- [References](#references)
 
 ## What is Direct Send?
 
@@ -444,3 +445,13 @@ Get-HistoricalSearch | Sort-Object SubmitDate -Descending | Select-Object -First
 ```
 
 The report is async and delivered as a CSV to the notify address. Useful for compliance-grade audits.
+
+## References
+
+Background reading on Direct Send, its abuse patterns, and Microsoft's new controls:
+
+- [Introducing more control over Direct Send in Exchange Online](https://techcommunity.microsoft.com/blog/exchange/introducing-more-control-over-direct-send-in-exchange-online/4408790) — Microsoft Exchange Team. The official announcement of the Reject Direct Send feature, with the authoritative definition of what gets blocked and guidance on allowlisting via inbound connectors.
+- [Direct Send vs. sending directly to an Exchange Online tenant](https://techcommunity.microsoft.com/blog/exchange/direct-send-vs-sending-directly-to-an-exchange-online-tenant/4439865) — Microsoft Exchange Team. Clarifies the technical distinction between Direct Send (accepted-domain sender, no connector) and other forms of anonymous delivery to the tenant MX; includes the Advanced Hunting KQL signature `Connectors == "" and isnotempty(SenderIPv4)`.
+- [Stop Spoofing Yourself! Disabling M365 Direct Send](https://www.blackhillsinfosec.com/disabling-m365-direct-send/) — Patterson Cake, Black Hills Information Security (Aug 2025). Walkthrough of the abuse pattern and how to disable Direct Send, written from the defender-perspective.
+- [Spoofing Microsoft 365 Like It's 1995](https://www.blackhillsinfosec.com/spoofing-microsoft-365-like-its-1995/) — Steve Borosh, Black Hills Information Security (May 2022). The original red-team write-up that brought wider attention to the Direct Send abuse path; demonstrates how anonymous SMTP to the tenant MX smart host bypasses email gateway protections to deliver convincing internal-looking phishing.
+- [How to Check Exchange Online Direct Send Email Activities](https://blog.admindroid.com/how-to-check-exchange-online-direct-send-email-activities/) — AdminDroid. A practical PowerShell-focused walkthrough of message-trace filtering for Direct Send detection, including the connector-name inspection approach that this script's deep-inspect mode implements at scale.
