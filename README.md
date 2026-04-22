@@ -121,7 +121,7 @@ $results | Group-Object FromIP | Sort-Object Count -Descending
 |---|---|---|---|
 | `-DelegatedOrganization` | string | (none) | Customer tenant domain or ID for GDAP/CSP connections. Omit to connect directly. |
 | `-Days` | int (1–90) | `10` | Days back from today to search. Values over 10 are auto-chunked into 10-day windows. |
-| `-OutputPath` | string | (none) | CSV export path. If omitted, results go to the pipeline. |
+| `-OutputPath` | string | (none) | CSV export path. When set, the CSV contains the message rows plus the source summary and DMARC block appended as additional rows (separated by a blank row and `--- SUMMARY ---` / `--- DMARC POLICY ---` marker rows), and the script's post-run summaries remain on screen instead of being scrolled off by the pipeline output. When omitted, results are emitted to the pipeline (for capture with `$r = .\Get-DirectSendReport.ps1 ...`). |
 | `-AcceptedDomains` | string[] | (auto) | Override the accepted domain list. If omitted, auto-detected via `Get-AcceptedDomain`. |
 | `-NewSession` | switch | `$false` | Disconnect any existing session before connecting. Use to switch credentials. |
 | `-ShowSchema` | switch | `$false` | Diagnostic mode: dump `Format-List *` for one record, then exit. |

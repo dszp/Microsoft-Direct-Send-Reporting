@@ -57,6 +57,12 @@
         the safe baseline before enabling Reject Direct Send with shared-cert inbound
         connectors; p=none undermines the defense-in-depth.
 
+    When -OutputPath is specified, the same two summaries are also appended to the
+    CSV itself (below the data rows, separated by a blank row and a marker row) so
+    the complete report lives in a single file. In that mode $results is NOT also
+    emitted to the pipeline -- the default table formatter would otherwise scroll
+    the console summaries off the top of the terminal.
+
 .PARAMETER DelegatedOrganization
     Customer tenant domain or tenant ID for GDAP/CSP delegated connections.
     Omit when connecting directly as Global Admin or Exchange Admin in the target tenant.
@@ -758,10 +764,42 @@ Write-Host $bar -ForegroundColor Cyan
 
 if ($OutputPath) {
     $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-    $resolved = if (Test-Path $OutputPath) { (Resolve-Path $OutputPath).Path } else { $OutputPath }
-    Write-Host "Results exported to: $resolved" -ForegroundColor Green
-}
 
-$results
+    # Append the source summary and DMARC block to the CSV as additional rows
+    # so the full report is preserved in a single artifact. The appended section
+    # uses the same row schema as the data but with a marker in the first column
+    # so it's easy to filter out in Excel (sort/filter on DateTime) or parse.
+    $csvAppend = [System.Collections.Generic.List[string]]::new()
+    $csvAppend.Add('')
+    $csvAppend.Add('"--- SUMMARY ---"')
+    $csvAppend.Add('"Top sources (ProxiedClientHostname)","Count","Category"')
+    if ($grouped) {
+        foreach ($g in $grouped) {
+            $cat = ($g.Group | Select-Object -First 1).Category
+            $name = $g.Name -replace '"', '""'
+            $csvAppend.Add('"' + $name + '","' + $g.Count + '","' + $cat + '"')
+        }
+    }
+    $csvAppend.Add('')
+    $csvAppend.Add('"--- DMARC POLICY ---"')
+    $csvAppend.Add('"Domain","Policy","Pct","Record"')
+    foreach ($domain in ($domainSet | Sort-Object)) {
+        $info = Get-DmarcInfo -Domain $domain
+        $policyCell = "p=$($info.Policy)"
+        $pctCell = if ($null -ne $info.Pct) { $info.Pct.ToString() } else { '' }
+        $recordCell = if ($info.Record) { ($info.Record -replace '"', '""') } else { '' }
+        $csvAppend.Add('"' + $domain + '","' + $policyCell + '","' + $pctCell + '","' + $recordCell + '"')
+    }
+    Add-Content -Path $OutputPath -Value $csvAppend -Encoding UTF8
+
+    $resolved = if (Test-Path $OutputPath) { (Resolve-Path $OutputPath).Path } else { $OutputPath }
+    Write-Host ''
+    Write-Host "Results exported to: $resolved" -ForegroundColor Green
+    # Don't emit $results to the pipeline when a file was requested. Otherwise
+    # the default table formatter prints every row at the end, scrolling the
+    # source summary and DMARC block off the top of the terminal.
+} else {
+    $results
+}
 
 #endregion
