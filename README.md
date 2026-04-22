@@ -266,6 +266,10 @@ openssl s_client -connect smtp.vendor.example.com:25 -starttls smtp -servername 
 
 Look at the `subject=CN=...` line and the Subject Alternative Names. For SendGrid's shared infrastructure this returns `CN=*.smtp.sendgrid.net`. A vendor with a dedicated cert will have their own domain instead.
 
+### CRITICAL: `-SenderDomains` must be your specific accepted domains
+
+For partner/allowlist connectors of this type, **`-SenderDomains` must be an explicit list of your own accepted domains** — the domains the vendor is sending *as*. Do NOT use `'*'` as the value. Combined with `-RestrictDomainsToCertificate $true` (or `-RestrictDomainsToIPAddresses $true`), a wildcard `-SenderDomains` tells Exchange "for mail from **any** domain, require this cert/IP — reject anything else." That will block virtually all inbound mail (Gmail, customer replies, everything) because nothing but the allowlisted vendor presents that cert. The TLS-cert / IP match is the authentication; `-SenderDomains` scopes which envelope senders the connector applies to.
+
 ### Example: allowlisting a SendGrid-based vendor (e.g., FieldOps)
 
 Your report shows rows like:
@@ -280,14 +284,15 @@ The `ProxiedClientHostname` ending in `.sendgrid.fieldops.example.com` tells you
 New-InboundConnector `
     -Name 'SendGrid (FieldOps)' `
     -ConnectorType Partner `
-    -SenderDomains '*' `
+    -SenderDomains 'contoso.com', 'contoso.net' `
     -TlsSenderCertificateName '*.smtp.sendgrid.net' `
     -RestrictDomainsToCertificate $true `
     -RequireTls $true `
+    -CloudServicesMailEnabled $false `
     -Enabled $true
 ```
 
-This uses SendGrid's shared wildcard cert (`*.smtp.sendgrid.net`), which means it allowlists **any** SendGrid customer sending to your tenant. That's only safe with DMARC enforcement (see below). If that's too broad, narrow it with `-SenderIPAddresses` listing the CIDR blocks the vendor actually uses, or combine both.
+Replace `contoso.com, contoso.net` with your own accepted domains that the vendor is sending *as*. The `*.smtp.sendgrid.net` cert is SendGrid's shared wildcard — any SendGrid customer sending mail claiming to be from one of your accepted domains will match this connector. That's only safe with DMARC enforcement (see below). If that's too broad, narrow further with `-SenderIPAddresses` listing the CIDR blocks the vendor actually uses, or combine both.
 
 ### Example: allowlisting a vendor with a dedicated cert
 
@@ -297,10 +302,11 @@ If the vendor has a dedicated cert (e.g., `subject=CN=*.mail.vendor-example.com`
 New-InboundConnector `
     -Name 'Vendor name' `
     -ConnectorType Partner `
-    -SenderDomains '*' `
+    -SenderDomains 'contoso.com', 'contoso.net' `
     -TlsSenderCertificateName '*.mail.vendor-example.com' `
     -RestrictDomainsToCertificate $true `
     -RequireTls $true `
+    -CloudServicesMailEnabled $false `
     -Enabled $true
 ```
 
@@ -312,7 +318,7 @@ When TLS cert matching isn't viable:
 New-InboundConnector `
     -Name 'Vendor name' `
     -ConnectorType OnPremises `
-    -SenderDomains '*' `
+    -SenderDomains 'contoso.com', 'contoso.net' `
     -SenderIPAddresses '149.72.203.0/24','167.89.0.0/24' `
     -RestrictDomainsToIPAddresses $true `
     -RequireTls $true `
