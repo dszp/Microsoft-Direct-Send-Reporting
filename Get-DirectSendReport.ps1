@@ -134,6 +134,8 @@
     .\Get-DirectSendReport.ps1 -ShowSchema
 
 .NOTES
+    Version: 1.3.0
+
     To diagnose output schema, run this after connecting:
       Get-MessageTraceV2 -ResultSize 1 | Format-List *
 
@@ -142,6 +144,33 @@
     It matches the pattern "<server>\Default <server>" when no configured inbound
     connector matched -- that's the Direct Send path per Microsoft's Reject Direct
     Send documentation.
+
+    Changelog:
+      1.3.0 (2026-04-23) - Add ReturnPath domain summary block to both the
+                           console output and the appended CSV summary rows.
+      1.2.0 (2026-04-23) - Surface the P1 envelope sender as the ReturnPath
+                           column and compute RdsAffected by evaluating the
+                           envelope sender against accepted domains (Reject
+                           Direct Send keys off P1, not the P2 header From;
+                           ESPs using a custom return-path subdomain slip past).
+      1.1.0 (2026-04-22) - When -OutputPath is set, append the source and DMARC
+                           summaries as additional CSV rows below the data
+                           rows (separated by a marker row) and suppress the
+                           pipeline output so the console summaries stay on
+                           screen instead of being scrolled off by the table
+                           formatter.
+      1.0.1 (2026-04-22) - Document the post-run console summaries in the
+                           script help. No behavior change.
+      1.0.0 (2026-04-22) - Initial release. Four-stage Direct Send filter
+                           (Default connector pattern, populated FromIP,
+                           accepted-domain sender + recipient, populated
+                           ProxiedClientHostname) with SpamLikely /
+                           AnonymousExternal / InternalRelay categorization,
+                           10-day window chunking up to 90 days, sliding
+                           100-per-5-min rate limiter on the Detail lookup,
+                           macOS/Linux REST support, GDAP/CSP delegation via
+                           -DelegatedOrganization, and post-run source + DMARC
+                           console summaries.
 #>
 
 [CmdletBinding()]

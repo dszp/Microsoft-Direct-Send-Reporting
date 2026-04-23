@@ -54,6 +54,21 @@
 
 .EXAMPLE
     ./Run-DirectSendGDAPReports.ps1 -Tenants agmaasindy.onmicrosoft.com,contoso.onmicrosoft.com -MaxParallel 3 -ScriptArgs @('-Days','30')
+
+.NOTES
+    Version: 1.0.0
+
+    Changelog:
+      1.0.0 (2026-04-23) - Initial release. Parallel fan-out wrapper around
+                           Get-DirectSendReport.ps1 for partners auditing
+                           multiple GDAP-delegated customer tenants. Uses
+                           Start-Job for process isolation (so each tenant
+                           gets its own Exchange Online session), throttles
+                           via -MaxParallel, reads tenants.txt (gitignored),
+                           names outputs per tenant, pre-connects each child
+                           session with -DisableWAM to work around the WAM
+                           GDAP token bug, and writes a per-tenant transcript
+                           log alongside each CSV.
 #>
 [CmdletBinding()]
 param(
