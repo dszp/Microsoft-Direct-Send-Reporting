@@ -38,7 +38,16 @@
     a 'logs' subfolder under -OutputDir.
 
 .PARAMETER MaxParallel
-    Maximum number of tenants to process concurrently. Default: 5.
+    Maximum number of tenants to process concurrently. Default: 1.
+
+    Defaults to 1 (sequential) because Get-MessageTraceDetailV2 is throttled
+    to 100 requests per 5 minutes *per user/identity*, not per tenant. When
+    a partner user runs multiple GDAP-delegated tenants in parallel they
+    all share that same quota, so parallelism does NOT add throughput --
+    it just spreads the same 100/5min across N tenants and tends to trip
+    the "surpassed the permitted limit" error. Raise this only if you know
+    you will not saturate the identity quota (small tenants, short
+    windows, or -NoDeepInspect).
 
 .PARAMETER ScriptArgs
     Extra arguments forwarded verbatim to Get-DirectSendReport.ps1 for every
@@ -62,9 +71,19 @@
     ./Run-DirectSendGDAPReports.ps1 -Tenants agmaasindy.onmicrosoft.com,contoso.onmicrosoft.com -MaxParallel 3 -ScriptArgs @('-Days','30')
 
 .NOTES
-    Version: 1.2.0
+    Version: 1.3.0
 
     Changelog:
+      1.3.0 (2026-04-23) - Change -MaxParallel default from 5 to 1.
+                           Get-MessageTraceDetailV2 is throttled per
+                           user/identity (100/5min), not per tenant, so
+                           running multiple GDAP tenants in parallel as
+                           the same partner user divides one quota across
+                           them rather than adding throughput -- and
+                           saturates Microsoft's limit quickly. Sequential
+                           is the correct default for shared-identity
+                           flows. Users who know they will not saturate
+                           can raise -MaxParallel explicitly.
       1.2.0 (2026-04-23) - Fix a parameter-binding bug that caused every
                            tenant to fail with "Cannot process argument
                            transformation on parameter 'Days'". Array
@@ -115,7 +134,7 @@ param(
 
     [Parameter()]
     [ValidateRange(1, 20)]
-    [int]$MaxParallel = 5,
+    [int]$MaxParallel = 1,
 
     [Parameter()]
     [string[]]$ScriptArgs,

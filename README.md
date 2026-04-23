@@ -127,20 +127,21 @@ For partners auditing many customer tenants at once, `Run-DirectSendGDAPReports.
 #   contoso.onmicrosoft.com
 #   fabrikam.onmicrosoft.com
 
-.\Run-DirectSendGDAPReports.ps1 -MaxParallel 5
+.\Run-DirectSendGDAPReports.ps1
 ```
 
 Forward extra arguments to the main script via `-ScriptArgs`:
 
 ```powershell
-.\Run-DirectSendGDAPReports.ps1 -MaxParallel 5 -ScriptArgs @('-Days','30','-IncludeInternalRelay')
+.\Run-DirectSendGDAPReports.ps1 -ScriptArgs @('-Days','30','-IncludeInternalRelay')
 ```
 
 Notes:
 
+- **`-MaxParallel` defaults to 1 (sequential).** `Get-MessageTraceDetailV2` is throttled to 100 requests per 5 minutes *per user/identity*, not per tenant, so when a partner user runs multiple GDAP-delegated tenants in parallel they share one quota — parallelism divides the same 100/5min across N tenants rather than adding throughput, and tends to trip the `"Your recent queries have surpassed the permitted limit"` error. On throttle, the script now backs off progressively (60s → 180s → 300s, up to 3 retries) and clears its local window between retries. Raise `-MaxParallel` only if you know you won't saturate the identity quota (small tenants, short `-Days`, or `-NoDeepInspect`).
 - The wrapper pre-connects each child session with `Connect-ExchangeOnline -DisableWAM` to work around the WAM GDAP token bug that produces `"The role assigned to user ... isn't supported in this scenario"`. Pass `-DisableWAM $false` to opt out.
 - Your partner-tenant user must be in a security group that is granted the **Exchange Administrator** Entra role on each target customer tenant via an active GDAP relationship. Other roles (Global Reader, Service Support Admin, etc.) will fail with the same error message.
-- The first run against a new tenant typically prompts interactively once per tenant to seed the MSAL token cache; subsequent runs are silent until tokens expire. If 5 simultaneous browser prompts is unwieldy, run once with `-MaxParallel 1` to seed the cache, then re-run at full concurrency.
+- The first run against a new tenant typically prompts interactively once per tenant to seed the MSAL token cache; subsequent runs are silent until tokens expire.
 - `tenants.txt` is listed in `.gitignore` because it usually contains real customer domains.
 
 ## Parameters

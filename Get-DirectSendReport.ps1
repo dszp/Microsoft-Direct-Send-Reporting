@@ -144,7 +144,7 @@
     .\Get-DirectSendReport.ps1 -ShowSchema
 
 .NOTES
-    Version: 1.4.1
+    Version: 1.5.0
 
     To diagnose output schema, run this after connecting:
       Get-MessageTraceV2 -ResultSize 1 | Format-List *
@@ -156,6 +156,16 @@
     Send documentation.
 
     Changelog:
+      1.5.0 (2026-04-23) - Progressive backoff on Get-MessageTraceDetailV2
+                           throttling. Previously a single 60s cooldown
+                           and one retry -- insufficient when the identity
+                           quota (100/5min per user, shared across parallel
+                           GDAP tenants) stayed exhausted. Now retries up
+                           to 3 times with 60s -> 180s -> 300s cooldowns
+                           and clears the local sliding-window between
+                           retries so the next call doesn't immediately
+                           re-saturate. Each cooldown is logged visibly so
+                           long pauses aren't mistaken for hangs.
       1.4.1 (2026-04-23) - Quiet DMARC lookup noise in transcripts. Switch
                            Resolve-DnsName to -ErrorAction SilentlyContinue
                            (NXDOMAIN no longer raises a caught terminating
@@ -637,15 +647,28 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
         $scl = $null
         $events = @()
 
-        # Retry once on throttle with a 60s cooldown before giving up on this record
-        for ($attempt = 1; $attempt -le 2; $attempt++) {
+        # Throttle recovery: "surpassed the permitted limit" is Microsoft's
+        # identity-level 100/5min limit for Get-MessageTraceDetailV2. When the
+        # wrapper runs multiple GDAP tenants in parallel as the same partner
+        # user they share one quota, so the local sliding-window here cannot
+        # see or prevent cross-process saturation. Progressive backoff (60s ->
+        # 180s -> 300s, up to 3 retries) and clear the local window each time
+        # so we don't burn the retry re-hammering the same saturated bucket.
+        $throttleBackoffs = @(60, 180, 300)
+        $maxAttempts = $throttleBackoffs.Count + 1
+        $throttleAttempts = 0
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             try {
                 $events = @(Get-MessageTraceDetailV2 -MessageTraceId $record.MessageTraceId -RecipientAddress $record.To -ErrorAction Stop)
                 break
             } catch {
-                if ($_.Exception.Message -match 'surpassed the permitted limit' -and $attempt -eq 1) {
-                    Write-Progress -Activity 'Deep inspection' -Status "Throttled at request $($i + 1); cooling down 60s" -PercentComplete $pct
-                    Start-Sleep -Seconds 60
+                if ($_.Exception.Message -match 'surpassed the permitted limit' -and $throttleAttempts -lt $throttleBackoffs.Count) {
+                    $wait = $throttleBackoffs[$throttleAttempts]
+                    $throttleAttempts++
+                    Write-Host ''
+                    Write-Host "Throttled at request $($i + 1)/$($allResults.Count); cooling down ${wait}s (retry $throttleAttempts/$($throttleBackoffs.Count))" -ForegroundColor Yellow
+                    Write-Progress -Activity 'Deep inspection' -Status "Throttled; cooling down ${wait}s (retry $throttleAttempts/$($throttleBackoffs.Count))" -PercentComplete $pct
+                    Start-Sleep -Seconds $wait
                     $requestTimes.Clear()
                     $requestTimes.Enqueue((Get-Date))
                     continue

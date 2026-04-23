@@ -9,10 +9,31 @@ This repo ships two scripts whose versions are tracked independently in each
 script's `.NOTES` block. The repo-level version below tracks the highest
 notable change across both. Current component versions:
 
-- `Get-DirectSendReport.ps1` — **1.4.1** (core auditor)
-- `Run-DirectSendGDAPReports.ps1` — **1.2.0** (parallel GDAP fan-out wrapper)
+- `Get-DirectSendReport.ps1` — **1.5.0** (core auditor)
+- `Run-DirectSendGDAPReports.ps1` — **1.3.0** (parallel GDAP fan-out wrapper)
 
 ## [Unreleased]
+
+## [1.6.0] - 2026-04-23
+
+### Changed
+
+- `Run-DirectSendGDAPReports.ps1` 1.3.0: `-MaxParallel` default changes
+  from 5 to 1 (sequential). `Get-MessageTraceDetailV2` is throttled to
+  100 requests per 5 minutes *per user/identity*, not per tenant, so
+  running multiple GDAP tenants in parallel as the same partner user
+  divides one quota across them instead of adding throughput. Sequential
+  is the correct default for shared-identity flows. Override with
+  `-MaxParallel N` when you know you won't saturate the identity quota
+  (small tenants, short `-Days`, or `-NoDeepInspect`). README updated
+  to drop `-MaxParallel 5` from the example invocations.
+- `Get-DirectSendReport.ps1` 1.5.0: progressive backoff on
+  `Get-MessageTraceDetailV2` throttling. Previously a single 60s
+  cooldown and one retry; now up to 3 retries with 60s → 180s → 300s
+  cooldowns and the local sliding-window is cleared between retries so
+  the next call doesn't immediately re-saturate the identity quota.
+  Each cooldown is logged visibly so long pauses aren't mistaken for
+  hangs.
 
 ## [1.5.1] - 2026-04-23
 
