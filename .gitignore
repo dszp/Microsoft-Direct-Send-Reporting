@@ -4,8 +4,9 @@
 # CSV report outputs
 *.csv
 
-# Local tenant list consumed by Run-DirectSendGDAPReports.ps1 (contains real customer domains)
+# Local tenant list consumed by Run-DirectSendGDAPReports.ps1 (contains real customer domains) and created log files
 tenants.txt
+*.log
 
 # Exclude dot-files by default except for .gitignore
 .*
