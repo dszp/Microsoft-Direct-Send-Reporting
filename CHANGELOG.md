@@ -9,10 +9,22 @@ This repo ships two scripts whose versions are tracked independently in each
 script's `.NOTES` block. The repo-level version below tracks the highest
 notable change across both. Current component versions:
 
-- `Get-DirectSendReport.ps1` — **1.5.0** (core auditor)
+- `Get-DirectSendReport.ps1` — **1.5.1** (core auditor)
 - `Run-DirectSendGDAPReports.ps1` — **1.3.0** (parallel GDAP fan-out wrapper)
 
 ## [Unreleased]
+
+## [1.6.1] - 2026-04-23
+
+### Changed
+
+- `Get-DirectSendReport.ps1` 1.5.1: timestamp the deep-inspection
+  messages so a `Start-Transcript` log is readable without guessing
+  elapsed time. Throttle lines now include `[HH:mm:ss]` and an estimated
+  resume time (e.g. `resume ~18:47:12`), and every 100 successful detail
+  lookups emits a `[HH:mm:ss] Progress: N/total processed; kept X, ...`
+  heartbeat line. Lets an operator tell "still pacing normally" from
+  "actually stuck" at a glance when tailing a long run.
 
 ## [1.6.0] - 2026-04-23
 

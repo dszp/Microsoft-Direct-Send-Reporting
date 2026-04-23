@@ -144,7 +144,7 @@
     .\Get-DirectSendReport.ps1 -ShowSchema
 
 .NOTES
-    Version: 1.5.0
+    Version: 1.5.1
 
     To diagnose output schema, run this after connecting:
       Get-MessageTraceV2 -ResultSize 1 | Format-List *
@@ -156,6 +156,14 @@
     Send documentation.
 
     Changelog:
+      1.5.1 (2026-04-23) - Timestamp deep-inspection messages so a
+                           Start-Transcript log is readable without
+                           guessing elapsed time. Throttle lines now
+                           include [HH:mm:ss] and an estimated resume
+                           time; every 100 successful detail lookups
+                           emits a heartbeat progress line. Helps
+                           distinguish "still pacing normally" from
+                           "actually stuck" when tailing a long run.
       1.5.0 (2026-04-23) - Progressive backoff on Get-MessageTraceDetailV2
                            throttling. Previously a single 60s cooldown
                            and one retry -- insufficient when the identity
@@ -606,13 +614,22 @@ foreach ($chunk in $chunks) {
 #region Deep inspection (authoritative ConnectorId from Detail event Data XML)
 
 if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
+    # [HH:mm:ss] prefix on long-running / transient messages so an operator
+    # reading the transcript later can tell how long pauses actually were
+    # (Start-Transcript does not timestamp individual lines).
+    $ts = { "[{0:HH:mm:ss}]" -f (Get-Date) }
     Write-Host ''
-    Write-Host "Deep inspection: pulling detail events for $($allResults.Count) candidate(s)..." -ForegroundColor Cyan
+    Write-Host "$(& $ts) Deep inspection: pulling detail events for $($allResults.Count) candidate(s)..." -ForegroundColor Cyan
     Write-Host 'Rate-limited to 100 requests per 5 minutes. Sliding-window pacing.' -ForegroundColor Gray
 
     $deepResults = [System.Collections.Generic.List[PSCustomObject]]::new()
     $excludedCustomConnector = 0
     $excludedInternalRelay = 0
+
+    # Heartbeat: emit a timestamped progress line every N successful records
+    # so a tail of the transcript confirms activity even when there's a long
+    # stretch without throttle events.
+    $heartbeatEvery = 100
 
     # Sliding-window rate limiter: 100 requests per 300 seconds.
     # Track timestamps of every detail call; before each new call, purge timestamps
@@ -626,6 +643,10 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
         $record = $allResults[$i]
         $pct = [int](($i / $allResults.Count) * 100)
         Write-Progress -Activity 'Deep inspection' -Status "$($i + 1) / $($allResults.Count) -- kept $($deepResults.Count)" -PercentComplete $pct
+
+        if ($i -gt 0 -and ($i % $heartbeatEvery) -eq 0) {
+            Write-Host "$(& $ts) Progress: $i/$($allResults.Count) processed; kept $($deepResults.Count), excluded $excludedCustomConnector custom-connector, $excludedInternalRelay internal-relay" -ForegroundColor DarkGray
+        }
 
         # Sliding-window rate limit: purge expired, wait if at capacity
         $now = Get-Date
@@ -666,7 +687,7 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
                     $wait = $throttleBackoffs[$throttleAttempts]
                     $throttleAttempts++
                     Write-Host ''
-                    Write-Host "Throttled at request $($i + 1)/$($allResults.Count); cooling down ${wait}s (retry $throttleAttempts/$($throttleBackoffs.Count))" -ForegroundColor Yellow
+                    Write-Host "$(& $ts) Throttled at request $($i + 1)/$($allResults.Count); cooling down ${wait}s (retry $throttleAttempts/$($throttleBackoffs.Count); resume ~$('{0:HH:mm:ss}' -f (Get-Date).AddSeconds($wait)))" -ForegroundColor Yellow
                     Write-Progress -Activity 'Deep inspection' -Status "Throttled; cooling down ${wait}s (retry $throttleAttempts/$($throttleBackoffs.Count))" -PercentComplete $pct
                     Start-Sleep -Seconds $wait
                     $requestTimes.Clear()
@@ -771,7 +792,7 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
     }
 
     Write-Progress -Activity 'Deep inspection' -Completed
-    Write-Host "  Inspected $($allResults.Count); excluded $excludedCustomConnector via custom connector, $excludedInternalRelay internal relay; kept $($deepResults.Count)." -ForegroundColor Cyan
+    Write-Host "$(& $ts) Inspected $($allResults.Count); excluded $excludedCustomConnector via custom connector, $excludedInternalRelay internal relay; kept $($deepResults.Count)." -ForegroundColor Cyan
 
     $allResults = $deepResults
 }
