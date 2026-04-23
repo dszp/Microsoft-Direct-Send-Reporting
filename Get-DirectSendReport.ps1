@@ -757,6 +757,76 @@ if ($results.Count -gt 0 -and ($results | Get-Member -Name ProxiedClientHostname
     Write-Host $bar -ForegroundColor Cyan
 }
 
+# ReturnPath domain summary -- group by the P1 envelope sender domain, with a
+# classification against the accepted-domain set. RDS blocks exact-match accepted
+# domains; subdomains of accepted domains and external domains pass through.
+# This is the most direct view of "who will be affected by RDS" for the admin.
+$returnPathGrouped = $null
+if ($results.Count -gt 0 -and ($results | Get-Member -Name ReturnPath -ErrorAction SilentlyContinue)) {
+    Write-Host ''
+    Write-Host 'ReturnPath (P1 envelope sender) domains:' -ForegroundColor Cyan
+
+    $returnPathGrouped = $results | ForEach-Object {
+        $rpDomain = if ($_.ReturnPath -match '@(.+)$') { $Matches[1].ToLower() } else { '<empty>' }
+        [PSCustomObject]@{
+            Domain = $rpDomain
+            Full = $_.ReturnPath
+        }
+    } | Group-Object Domain | Sort-Object Count -Descending
+
+    # Classify each domain against accepted-domain set
+    $rpClassified = foreach ($g in $returnPathGrouped) {
+        $classification = if ($g.Name -eq '<empty>') { 'unknown' }
+                          elseif ($domainSet.Contains($g.Name)) { 'accepted' }
+                          else {
+                              $isSubdomain = $false
+                              foreach ($accepted in $domainSet) {
+                                  if ($g.Name.EndsWith(".$accepted")) { $isSubdomain = $true; break }
+                              }
+                              if ($isSubdomain) { 'subdomain' } else { 'external' }
+                          }
+        [PSCustomObject]@{
+            Domain = $g.Name
+            Count = $g.Count
+            Classification = $classification
+        }
+    }
+
+    $rpColWidth = 0
+    foreach ($r in $rpClassified) {
+        if ($r.Domain.Length -gt $rpColWidth) { $rpColWidth = $r.Domain.Length }
+    }
+    $rpColWidth = [Math]::Max(20, [Math]::Min(48, $rpColWidth))
+
+    foreach ($r in $rpClassified) {
+        $color = switch ($r.Classification) {
+            'accepted'  { 'Red' }
+            'subdomain' { 'Green' }
+            'external'  { 'Cyan' }
+            'unknown'   { 'DarkGray' }
+            default     { 'White' }
+        }
+        $rdsBehavior = switch ($r.Classification) {
+            'accepted'  { '[RDS BLOCKS]      accepted domain' }
+            'subdomain' { '[RDS passes]      subdomain of accepted' }
+            'external'  { '[RDS passes]      external domain' }
+            'unknown'   { '[RDS unknown]     empty/unparseable' }
+            default     { '' }
+        }
+        $domainDisplay = if ($r.Domain.Length -gt $rpColWidth) { $r.Domain.Substring(0, $rpColWidth - 1) + '…' } else { $r.Domain }
+        $padded = $domainDisplay.PadRight($rpColWidth)
+        $countStr = $r.Count.ToString().PadLeft(5)
+        Write-Host "  $padded  $countStr  $rdsBehavior" -ForegroundColor $color
+    }
+
+    Write-Host ''
+    Write-Host 'Only Red (accepted-domain) rows are impacted by Reject Direct Send.' -ForegroundColor DarkGray
+    Write-Host 'Green (subdomain) and Cyan (external) rows slide past RDS automatically -- no' -ForegroundColor DarkGray
+    Write-Host 'allowlist work needed. For Red rows, create an inbound connector OR ask the' -ForegroundColor DarkGray
+    Write-Host 'sender to switch to a custom return-path subdomain (like Postmark does).' -ForegroundColor DarkGray
+    Write-Host $bar -ForegroundColor Cyan
+}
+
 # DMARC policy check per accepted domain. When Reject Direct Send is enabled with
 # shared-certificate connectors (e.g., *.smtp.sendgrid.net), defense-in-depth
 # depends on DMARC enforcement -- p=none undermines the approach because auth
@@ -816,6 +886,22 @@ if ($OutputPath) {
             $rdsBlocks = "$rdsCount/$($g.Group.Count)"
             $name = $g.Name -replace '"', '""'
             $csvAppend.Add('"' + $name + '","' + $g.Count + '","' + $cat + '","' + $rdsBlocks + '"')
+        }
+    }
+    $csvAppend.Add('')
+    $csvAppend.Add('"--- RETURNPATH DOMAINS ---"')
+    $csvAppend.Add('"Domain","Count","Classification","RdsBehavior"')
+    if ($rpClassified) {
+        foreach ($r in $rpClassified) {
+            $rdsBehavior = switch ($r.Classification) {
+                'accepted' { 'blocks' }
+                'subdomain' { 'passes' }
+                'external' { 'passes' }
+                'unknown' { 'unknown' }
+                default { '' }
+            }
+            $domainCell = $r.Domain -replace '"', '""'
+            $csvAppend.Add('"' + $domainCell + '","' + $r.Count + '","' + $r.Classification + '","' + $rdsBehavior + '"')
         }
     }
     $csvAppend.Add('')

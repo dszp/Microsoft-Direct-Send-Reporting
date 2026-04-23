@@ -15,6 +15,7 @@ PowerShell script to audit emails delivered via Microsoft Direct Send in an Exch
   - [Source summary](#source-summary)
   - [Reading the Category column](#reading-the-category-column)
   - [Missing traffic you expected to see](#missing-traffic-you-expected-to-see)
+- [ReturnPath Domain Summary](#returnpath-domain-summary)
 - [DMARC Policy Check](#dmarc-policy-check)
 - [The `InternalRelay` Category](#the-internalrelay-category)
 - [How Detection Works](#how-detection-works)
@@ -207,6 +208,33 @@ How to read it:
 ### Missing traffic you expected to see
 
 If your signature platform processes *all* internal mail but only a small subset appears in this report, you likely have **two** inbound paths configured — one that matches the connector (and thus doesn't appear here) and one that falls through to the default anonymous path (which does). Double-check the sending IP ranges of your signature provider against your inbound connector's IP allowlist; the ones appearing here are coming from IPs that your connector doesn't match.
+
+## ReturnPath Domain Summary
+
+Between the source summary and the DMARC block, the script prints a grouping of every `ReturnPath` (P1 envelope sender) domain found in the results, classified by its relationship to your accepted-domain set. This is the most direct "who gets blocked by RDS" view.
+
+Example output:
+
+```
+ReturnPath (P1 envelope sender) domains:
+  contoso.com                         58  [RDS BLOCKS]      accepted domain
+  pmsv-bounces.contoso.com            47  [RDS passes]      subdomain of accepted
+  bounces.u12345.wl.sendgrid.net      12  [RDS passes]      external domain
+  mta.us.mailgun-custom.com            8  [RDS passes]      external domain
+  <empty>                              2  [RDS unknown]     empty/unparseable
+```
+
+Categories:
+- **`accepted` (red) — RDS BLOCKS.** The ReturnPath domain exactly matches an accepted domain. These are the messages that Reject Direct Send will actually block. Every cluster here needs disposition: create an inbound connector for legitimate sources, and let the malicious ones get blocked.
+- **`subdomain` (green) — RDS passes.** The ReturnPath domain is a subdomain of an accepted domain but isn't itself in your accepted-domains list. This is the "custom return-path subdomain" ESP best practice (Postmark's `pmsv-bounces.contoso.com`, Amazon SES's `N.eu-west-1.amazonses.com`, etc.). RDS ignores these automatically. No action needed.
+- **`external` (cyan) — RDS passes.** ReturnPath uses a completely different domain from any of your accepted domains. Usually an ESP's default bounce domain or a bounce handling service. RDS doesn't care about these. No action needed.
+- **`unknown` (gray) — RDS indeterminate.** ReturnPath was empty or we couldn't parse it. Uncommon — usually indicates a detail lookup failure or malformed trace data.
+
+**How to act on this view:**
+- Every red row is the full list of allowlisting work you have. Cross-reference against the source summary's cluster hostnames to identify the sender for each. Build one inbound connector per legitimate provider.
+- Red rows that you can't identify — or where the sender is obviously abusive — don't need a connector. They'll be correctly blocked when RDS enables.
+- Green/cyan rows tell you who's already doing the right thing (custom return-path subdomain). If one of these is a provider you weren't sure about, this is the definitive "they're fine" signal — skip them.
+- If you see a red cluster that you expect to be green (e.g., your Postmark traffic showing accepted-domain ReturnPath), it means that provider's setup in your tenant hasn't been switched to their custom-return-path mode — often a per-account toggle in the provider's UI.
 
 ## DMARC Policy Check
 
