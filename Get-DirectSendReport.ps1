@@ -102,6 +102,16 @@
     the default connector path -- for example, to find an on-prem relay that should
     be formalized with a named inbound connector.
 
+.PARAMETER UseWAM
+    Opt in to Connect-ExchangeOnline's WAM (Web Account Manager) broker. By
+    default this script passes -DisableWAM, which forces the browser-based
+    interactive flow instead of the Windows native account picker. The default
+    also avoids the known WAM GDAP token bug that produces "The role assigned
+    to user ... isn't supported in this scenario" even when the role is correct.
+    Use -UseWAM only if you specifically want the WAM broker (e.g. cached
+    Windows account SSO) and you are not hitting the GDAP token bug. Ignored
+    on macOS/Linux and on module versions that don't expose the parameter.
+
 .PARAMETER NoDeepInspect
     Skip the per-candidate Get-MessageTraceDetailV2 lookup. This avoids the rate-limit
     delay but loses the authoritative ConnectorId check, the ProxiedClientHostname-
@@ -134,7 +144,7 @@
     .\Get-DirectSendReport.ps1 -ShowSchema
 
 .NOTES
-    Version: 1.3.0
+    Version: 1.4.0
 
     To diagnose output schema, run this after connecting:
       Get-MessageTraceV2 -ResultSize 1 | Format-List *
@@ -146,6 +156,12 @@
     Send documentation.
 
     Changelog:
+      1.4.0 (2026-04-23) - Default Connect-ExchangeOnline to -DisableWAM so
+                           Windows auth goes through the browser instead of
+                           the native WAM account picker (which also trips
+                           the known WAM GDAP token bug). Add -UseWAM switch
+                           to opt back in to the WAM broker for cached-SSO
+                           scenarios.
       1.3.0 (2026-04-23) - Add ReturnPath domain summary block to both the
                            console output and the appended CSV summary rows.
       1.2.0 (2026-04-23) - Surface the P1 envelope sender as the ReturnPath
@@ -198,7 +214,10 @@ param(
     [switch]$IncludeInternalRelay,
 
     [Parameter()]
-    [switch]$NoDeepInspect
+    [switch]$NoDeepInspect,
+
+    [Parameter()]
+    [switch]$UseWAM
 )
 
 $ErrorActionPreference = 'Stop'
@@ -283,6 +302,15 @@ if ($DelegatedOrganization) {
 $exoCmd = Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue
 if ($exoCmd -and $exoCmd.Parameters.ContainsKey('UseRPSSession')) {
     $connectParams['UseRPSSession'] = $false
+}
+
+# On Windows, Connect-ExchangeOnline defaults to the WAM broker, which pops a
+# native Windows account picker instead of a browser and also trips the known
+# WAM GDAP token bug ("The role assigned to user ... isn't supported in this
+# scenario"). Default here is to pass -DisableWAM so auth goes through the
+# browser; -UseWAM opts back in to the WAM broker.
+if (-not $UseWAM -and $exoCmd -and $exoCmd.Parameters.ContainsKey('DisableWAM')) {
+    $connectParams['DisableWAM'] = $true
 }
 
 $existingConnection = $null

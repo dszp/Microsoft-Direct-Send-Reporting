@@ -62,9 +62,23 @@
     ./Run-DirectSendGDAPReports.ps1 -Tenants agmaasindy.onmicrosoft.com,contoso.onmicrosoft.com -MaxParallel 3 -ScriptArgs @('-Days','30')
 
 .NOTES
-    Version: 1.1.0
+    Version: 1.2.0
 
     Changelog:
+      1.2.0 (2026-04-23) - Fix a parameter-binding bug that caused every
+                           tenant to fail with "Cannot process argument
+                           transformation on parameter 'Days'". Array
+                           splatting (@('-Name','value',...)) passes items
+                           positionally in PowerShell -- '-Name' tokens are
+                           NOT interpreted as parameter names inside an
+                           array splat, so the tenant string was landing on
+                           -Days and failing int conversion. Switched to
+                           hashtable splatting for the named args and parse
+                           -ScriptArgs tokens into the same hashtable.
+                           Forward -UseWAM to the child script when the
+                           wrapper -DisableWAM is $false, so pre-connect
+                           and child-script auth stay in sync with the
+                           main script's new DisableWAM-by-default behavior.
       1.1.0 (2026-04-23) - Per-tenant transcript logs now write to a 'logs'
                            subfolder under -OutputDir by default (created
                            automatically). Add -LogDir to override; relative
@@ -196,11 +210,49 @@ foreach ($tenant in $Tenants) {
             }
             Connect-ExchangeOnline @connect
 
-            $argList = @('-DelegatedOrganization', $Tenant, '-OutputPath', $CsvPath)
-            if ($Extra) { $argList += $Extra }
+            # Build a splat hashtable. Array splatting (@('-Name','value',...))
+            # passes items POSITIONALLY only -- PowerShell does NOT interpret
+            # '-Name' tokens as parameter names inside an array splat. That
+            # silently mis-binds args (e.g. the tenant string lands on -Days
+            # and fails int conversion). Hashtable splatting is the only
+            # reliable way to pass named args through a script invocation.
+            $splat = @{
+                DelegatedOrganization = $Tenant
+                OutputPath            = $CsvPath
+            }
+            # Child script now defaults to -DisableWAM. Only forward -UseWAM
+            # when the wrapper opted out of DisableWAM, so pre-connect and
+            # child-script auth behavior stay in sync.
+            if (-not $UseDisableWAM) { $splat['UseWAM'] = $true }
 
-            Write-Host "[$Tenant] running: $MainScript $($argList -join ' ')"
-            & $MainScript @argList
+            # Parse -ScriptArgs (verbatim tokens like @('-Days','30','-IncludeInternalRelay'))
+            # into the splat hashtable so they're forwarded as named args.
+            if ($Extra) {
+                $i = 0
+                while ($i -lt $Extra.Count) {
+                    $token = [string]$Extra[$i]
+                    if ($token -match '^-(.+)$') {
+                        $name = $Matches[1]
+                        $hasValue = ($i + 1 -lt $Extra.Count) -and
+                                    ([string]$Extra[$i + 1] -notmatch '^-')
+                        if ($hasValue) {
+                            $splat[$name] = $Extra[$i + 1]
+                            $i += 2
+                        } else {
+                            $splat[$name] = $true
+                            $i += 1
+                        }
+                    } else {
+                        throw "Unexpected positional token in -ScriptArgs at index ${i}: '$token' (expected -Name [value] pairs)"
+                    }
+                }
+            }
+
+            $preview = ($splat.GetEnumerator() | ForEach-Object {
+                if ($_.Value -is [bool]) { "-$($_.Key)" } else { "-$($_.Key) $($_.Value)" }
+            }) -join ' '
+            Write-Host "[$Tenant] running: $MainScript $preview"
+            & $MainScript @splat
             $code = $LASTEXITCODE
             Write-Host "[$Tenant] done (exit=$code) -> $CsvPath"
         }
