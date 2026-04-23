@@ -57,6 +57,18 @@ Also: `RdsAffected` evaluates the **P1 envelope sender (ReturnPath)**, not the P
 - The wrapper uses `Start-Job` (separate pwsh processes), not `ForEach-Object -Parallel` (same-process runspaces), because Exchange Online session state is process-global and would cross-contaminate between tenants in a shared runspace. If you rewrite the parallelism, preserve process isolation.
 - MSAL token cache is on-disk (Keychain on macOS). First run against a new tenant prompts interactively; subsequent runs are silent until tokens expire. Running `-MaxParallel 5` against unseeded tenants opens 5 simultaneous browser prompts — advise `-MaxParallel 1` first to seed, then ramp up.
 
+## Docs + versioning workflow (required for any user-visible change)
+
+There is no build system or test suite, so documentation *is* the release artifact. Any change that alters behavior, flags, output, or operator workflow must update all of the following in the **same commit** — never just one of them:
+
+1. **Script version + changelog at the top of the changed script's `.NOTES` block.** `Get-DirectSendReport.ps1` and `Run-DirectSendGDAPReports.ps1` each carry their own `Version:` line and inline changelog. Bump the component's version using SemVer against *its own* prior version (patch for docs-only/internal fix with no user-visible change, minor for new flags or behavior changes, major for breaking changes). Add a dated entry describing *why* — readers look here first when a tenant run behaves differently than last week.
+2. **`CHANGELOG.md` at the repo root.** Add a new `## [x.y.z] - YYYY-MM-DD` section using the highest component bump as the repo version (e.g., if the wrapper goes 1.1.0 → 1.2.0 and the main script goes 1.3.0 → 1.4.0, the repo bumps to 1.5.0 or higher). Also update the "Current component versions" list near the top so it matches what's in each script's `.NOTES`. Sections follow Keep a Changelog: `Added` / `Changed` / `Fixed` / `Removed`.
+3. **`README.md`** if the change is user-facing — new flags, changed defaults, new failure modes worth warning about, invocation examples that would now mislead. Skim the usage and troubleshooting sections; don't leave stale example commands or outdated behavior claims.
+4. **Comment-based help for new/renamed parameters.** Add/update the corresponding `.PARAMETER <Name>` block at the top of the script so `Get-Help` stays accurate. If a parameter's default changes, update the `.PARAMETER` text too (don't let it contradict the param block).
+5. **CLAUDE.md (this file)** only when the change invalidates guidance here — renamed flags referenced above, detection-pipeline changes, new gotchas a future session needs. Don't restate the changelog.
+
+If a change genuinely doesn't warrant a version bump (e.g., fixing a typo in a comment), say so explicitly rather than silently skipping the workflow. When in doubt, bump.
+
 ## Repo hygiene
 
 `tenants.txt` in the root is the customer list consumed by the wrapper and is **gitignored** because it contains real customer domains. `.gitignore` also blanket-ignores dot-files (`.*`) with a `!.gitignore` re-include, plus `*.csv` and `*.txt` for report outputs. When adding new tracked files, avoid names that would be swept up by those patterns.
