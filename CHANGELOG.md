@@ -9,10 +9,24 @@ This repo ships two scripts whose versions are tracked independently in each
 script's `.NOTES` block. The repo-level version below tracks the highest
 notable change across both. Current component versions:
 
-- `Get-DirectSendReport.ps1` — **1.4.0** (core auditor)
+- `Get-DirectSendReport.ps1` — **1.4.1** (core auditor)
 - `Run-DirectSendGDAPReports.ps1` — **1.2.0** (parallel GDAP fan-out wrapper)
 
 ## [Unreleased]
+
+## [1.5.1] - 2026-04-23
+
+### Fixed
+
+- `Get-DirectSendReport.ps1` 1.4.1: quiet the DMARC lookup noise that made
+  per-tenant transcripts look like script failures when `_dmarc.<domain>`
+  did not exist. `Resolve-DnsName` now uses `-ErrorAction SilentlyContinue`
+  (NXDOMAIN no longer raises a caught terminating error that
+  `Start-Transcript` logs) and the `nslookup` fallback merges stderr into
+  stdout via `2>&1` (pwsh 7 on Windows does not reliably honor `2>$null`
+  for native-command stderr, so `*** UnKnown can't find _dmarc.<domain>`
+  was leaking into the transcript). Behavior is unchanged: missing DMARC
+  records still report `p=no record` and the run continues.
 
 ## [1.5.0] - 2026-04-23
 

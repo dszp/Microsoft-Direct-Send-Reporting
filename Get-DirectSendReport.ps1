@@ -144,7 +144,7 @@
     .\Get-DirectSendReport.ps1 -ShowSchema
 
 .NOTES
-    Version: 1.4.0
+    Version: 1.4.1
 
     To diagnose output schema, run this after connecting:
       Get-MessageTraceV2 -ResultSize 1 | Format-List *
@@ -156,6 +156,15 @@
     Send documentation.
 
     Changelog:
+      1.4.1 (2026-04-23) - Quiet DMARC lookup noise in transcripts. Switch
+                           Resolve-DnsName to -ErrorAction SilentlyContinue
+                           (NXDOMAIN no longer raises a caught terminating
+                           error that Start-Transcript logs as a failure)
+                           and merge nslookup stderr into stdout via 2>&1
+                           (pwsh 7 on Windows does not reliably honor
+                           2>$null for native command stderr). Behavior
+                           unchanged: missing _dmarc records still report
+                           p=no record.
       1.4.0 (2026-04-23) - Default Connect-ExchangeOnline to -DisableWAM so
                            Windows auth goes through the browser instead of
                            the native WAM account picker (which also trips
@@ -241,18 +250,27 @@ function Get-DmarcInfo {
     $record = $null
 
     if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
-        try {
-            $txtRecords = Resolve-DnsName -Name "_dmarc.$Domain" -Type TXT -ErrorAction Stop
+        # -ErrorAction SilentlyContinue (not Stop + try/catch) so NXDOMAIN does
+        # not surface as a caught terminating error -- Start-Transcript logs
+        # every terminating error even when caught, which makes "_dmarc.<domain>
+        # does not exist" look like a script failure in the per-tenant log.
+        $txtRecords = Resolve-DnsName -Name "_dmarc.$Domain" -Type TXT -ErrorAction SilentlyContinue
+        if ($txtRecords) {
             foreach ($r in $txtRecords) {
                 $full = if ($r.Strings) { $r.Strings -join '' } elseif ($r.Text) { $r.Text } else { '' }
                 if ($full -match '^v=DMARC1') { $record = $full; break }
             }
-        } catch { }
+        }
     }
 
     if (-not $record) {
+        # Merge nslookup stderr into stdout (2>&1) rather than 2>$null. Native
+        # command stderr on pwsh 7 / Windows does not reliably honor 2>$null
+        # and leaks "*** UnKnown can't find _dmarc.<domain>: Non-existent
+        # domain" into the transcript. Merging keeps it inside $output, which
+        # we only scan for DMARC1 lines.
         try {
-            $output = & nslookup -type=TXT "_dmarc.$Domain" 2>$null | Out-String
+            $output = & nslookup -type=TXT "_dmarc.$Domain" 2>&1 | Out-String
             if ($output -match '"(v=DMARC1[^"]*)"') {
                 $record = $Matches[1]
             } elseif ($output -match '(v=DMARC1[^\r\n]*)') {
