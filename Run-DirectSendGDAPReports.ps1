@@ -30,7 +30,12 @@
     with '#' are ignored. Default: tenants.txt next to this script.
 
 .PARAMETER OutputDir
-    Directory to write CSVs and logs into. Default: the script's directory.
+    Directory to write per-tenant CSVs into. Default: the script's directory.
+
+.PARAMETER LogDir
+    Directory to write per-tenant transcript logs into. Created if it does
+    not exist. Relative paths are resolved against -OutputDir. Default:
+    a 'logs' subfolder under -OutputDir.
 
 .PARAMETER MaxParallel
     Maximum number of tenants to process concurrently. Default: 5.
@@ -49,16 +54,21 @@
 .EXAMPLE
     ./Run-DirectSendGDAPReports.ps1
 
-    Reads tenants.txt next to the script, fans out up to 5 in parallel, and
-    writes per-tenant CSVs and logs into the script's directory.
+    Reads tenants.txt next to the script, fans out up to 5 in parallel,
+    writes per-tenant CSVs into the script's directory, and per-tenant
+    transcript logs into .\logs\ (created if missing).
 
 .EXAMPLE
     ./Run-DirectSendGDAPReports.ps1 -Tenants agmaasindy.onmicrosoft.com,contoso.onmicrosoft.com -MaxParallel 3 -ScriptArgs @('-Days','30')
 
 .NOTES
-    Version: 1.0.1
+    Version: 1.1.0
 
     Changelog:
+      1.1.0 (2026-04-23) - Per-tenant transcript logs now write to a 'logs'
+                           subfolder under -OutputDir by default (created
+                           automatically). Add -LogDir to override; relative
+                           paths resolve against -OutputDir.
       1.0.1 (2026-04-23) - Fix -MaxParallel throttle. The check was inspecting
                            $_.State on the wrapper object (no such property),
                            so it always evaluated to zero running jobs and
@@ -87,6 +97,9 @@ param(
     [string]$OutputDir,
 
     [Parameter()]
+    [string]$LogDir,
+
+    [Parameter()]
     [ValidateRange(1, 20)]
     [int]$MaxParallel = 5,
 
@@ -109,6 +122,19 @@ if (-not (Test-Path $mainScript)) {
 if (-not $OutputDir) { $OutputDir = $here }
 $OutputDir = (Resolve-Path $OutputDir).Path
 
+# Resolve the log directory. Default: <OutputDir>/logs. A relative -LogDir
+# is resolved against -OutputDir; an absolute one is taken as-is. Create it
+# if missing so Start-Transcript doesn't fail in the child jobs.
+if (-not $LogDir) {
+    $LogDir = Join-Path $OutputDir 'logs'
+} elseif (-not [System.IO.Path]::IsPathRooted($LogDir)) {
+    $LogDir = Join-Path $OutputDir $LogDir
+}
+if (-not (Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+$LogDir = (Resolve-Path $LogDir).Path
+
 if (-not $Tenants -or $Tenants.Count -eq 0) {
     if (-not $TenantFile) { $TenantFile = Join-Path $here 'tenants.txt' }
     if (-not (Test-Path $TenantFile)) {
@@ -120,7 +146,7 @@ if (-not $Tenants -or $Tenants.Count -eq 0) {
 }
 
 if (-not $Tenants -or $Tenants.Count -eq 0) {
-    throw 'No tenants to process. Populate .claude/tenants.txt or pass -Tenants.'
+    throw 'No tenants to process. Populate tenants.txt or pass -Tenants.'
 }
 
 # Map tenant -> short name used in output filenames.
@@ -141,6 +167,7 @@ Write-Host ""
 Write-Host "Tenants:     $($Tenants.Count)" -ForegroundColor Cyan
 Write-Host "MaxParallel: $MaxParallel" -ForegroundColor Cyan
 Write-Host "OutputDir:   $OutputDir" -ForegroundColor Cyan
+Write-Host "LogDir:      $LogDir" -ForegroundColor Cyan
 Write-Host "DisableWAM:  $DisableWAM" -ForegroundColor Cyan
 if ($ScriptArgs) { Write-Host "ScriptArgs:  $($ScriptArgs -join ' ')" -ForegroundColor Cyan }
 Write-Host ""
@@ -149,7 +176,7 @@ $jobs = @()
 foreach ($tenant in $Tenants) {
     $short    = Get-TenantShortName $tenant
     $csvPath  = Join-Path $OutputDir ("{0}-directsend.csv" -f $short)
-    $logPath  = Join-Path $OutputDir ("{0}-directsend.log" -f $short)
+    $logPath  = Join-Path $LogDir    ("{0}-directsend.log" -f $short)
 
     $scriptBlock = {
         param($MainScript, $Tenant, $CsvPath, $LogPath, $Extra, $UseDisableWAM)

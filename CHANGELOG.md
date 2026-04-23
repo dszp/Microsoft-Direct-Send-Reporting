@@ -10,9 +10,19 @@ script's `.NOTES` block. The repo-level version below tracks the highest
 notable change across both. Current component versions:
 
 - `Get-DirectSendReport.ps1` — **1.3.0** (core auditor)
-- `Run-DirectSendGDAPReports.ps1` — **1.0.1** (parallel GDAP fan-out wrapper)
+- `Run-DirectSendGDAPReports.ps1` — **1.1.0** (parallel GDAP fan-out wrapper)
 
 ## [Unreleased]
+
+## [1.4.0] - 2026-04-23
+
+### Added
+
+- `Run-DirectSendGDAPReports.ps1` 1.1.0: new `-LogDir` parameter to control
+  where per-tenant transcript logs are written. Logs now default to a
+  `logs/` subfolder under `-OutputDir` (created automatically) instead of
+  sitting next to the CSVs. Relative `-LogDir` values are resolved against
+  `-OutputDir`. `logs/` is gitignored.
 
 ## [1.3.1] - 2026-04-23
 

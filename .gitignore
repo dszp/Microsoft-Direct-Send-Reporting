@@ -8,6 +8,9 @@
 tenants.txt
 *.log
 
+# Per-tenant transcript logs directory written by Run-DirectSendGDAPReports.ps1
+logs/
+
 # Exclude dot-files by default except for .gitignore
 .*
 !.gitignore
