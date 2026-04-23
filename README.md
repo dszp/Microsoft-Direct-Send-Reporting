@@ -117,6 +117,31 @@ $results | Where-Object { $_.Category -eq 'AnonymousExternal' }
 $results | Group-Object FromIP | Sort-Object Count -Descending
 ```
 
+### Run against many GDAP tenants in parallel
+
+For partners auditing many customer tenants at once, `Run-DirectSendGDAPReports.ps1` wraps the main script and fans out across a list of tenants, each in its own `pwsh` child process (so every tenant gets an isolated Exchange Online session). Output is written to one CSV per tenant, named `<short>-directsend.csv` where `<short>` is the tenant's primary domain with `.onmicrosoft.com` stripped off. A matching `.log` file captures the transcript for that tenant.
+
+```powershell
+# List customer tenants one per line in tenants.txt (gitignored by default):
+#   contoso.onmicrosoft.com
+#   fabrikam.onmicrosoft.com
+
+.\Run-DirectSendGDAPReports.ps1 -MaxParallel 5
+```
+
+Forward extra arguments to the main script via `-ScriptArgs`:
+
+```powershell
+.\Run-DirectSendGDAPReports.ps1 -MaxParallel 5 -ScriptArgs @('-Days','30','-IncludeInternalRelay')
+```
+
+Notes:
+
+- The wrapper pre-connects each child session with `Connect-ExchangeOnline -DisableWAM` to work around the WAM GDAP token bug that produces `"The role assigned to user ... isn't supported in this scenario"`. Pass `-DisableWAM $false` to opt out.
+- Your partner-tenant user must be in a security group that is granted the **Exchange Administrator** Entra role on each target customer tenant via an active GDAP relationship. Other roles (Global Reader, Service Support Admin, etc.) will fail with the same error message.
+- The first run against a new tenant typically prompts interactively once per tenant to seed the MSAL token cache; subsequent runs are silent until tokens expire. If 5 simultaneous browser prompts is unwieldy, run once with `-MaxParallel 1` to seed the cache, then re-run at full concurrency.
+- `tenants.txt` is listed in `.gitignore` because it usually contains real customer domains.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |

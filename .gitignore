@@ -3,3 +3,13 @@
 
 # CSV report outputs
 *.csv
+
+# Local tenant list consumed by Run-DirectSendGDAPReports.ps1 (contains real customer domains)
+tenants.txt
+
+# Exclude dot-files by default except for .gitignore
+.*
+!.gitignore
+
+# Ignore all .txt files as we shouldn't need them in the repo.
+*.txt
