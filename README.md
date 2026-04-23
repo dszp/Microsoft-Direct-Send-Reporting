@@ -9,6 +9,7 @@ PowerShell script to audit emails delivered via Microsoft Direct Send in an Exch
 - [What is Direct Send?](#what-is-direct-send)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
+- [Run Against Many GDAP Tenants in Parallel](#run-against-many-gdap-tenants-in-parallel)
 - [Parameters](#parameters)
 - [Output Fields](#output-fields)
 - [Interpreting the Results](#interpreting-the-results)
@@ -117,7 +118,7 @@ $results | Where-Object { $_.Category -eq 'AnonymousExternal' }
 $results | Group-Object FromIP | Sort-Object Count -Descending
 ```
 
-### Run against many GDAP tenants in parallel
+## Run Against Many GDAP Tenants in Parallel
 
 For partners auditing many customer tenants at once, `Run-DirectSendGDAPReports.ps1` wraps the main script and fans out across a list of tenants, each in its own `pwsh` child process (so every tenant gets an isolated Exchange Online session). Output is written to one CSV per tenant, named `<short>-directsend.csv` where `<short>` is the tenant's primary domain with `.onmicrosoft.com` stripped off. A matching `.log` file captures the transcript for that tenant.
 
