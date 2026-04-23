@@ -9,10 +9,39 @@ This repo ships two scripts whose versions are tracked independently in each
 script's `.NOTES` block. The repo-level version below tracks the highest
 notable change across both. Current component versions:
 
-- `Get-DirectSendReport.ps1` — **1.3.0** (core auditor)
-- `Run-DirectSendGDAPReports.ps1` — **1.1.0** (parallel GDAP fan-out wrapper)
+- `Get-DirectSendReport.ps1` — **1.4.0** (core auditor)
+- `Run-DirectSendGDAPReports.ps1` — **1.2.0** (parallel GDAP fan-out wrapper)
 
 ## [Unreleased]
+
+## [1.5.0] - 2026-04-23
+
+### Fixed
+
+- `Run-DirectSendGDAPReports.ps1` 1.2.0: parameter-binding bug that caused
+  every tenant to fail with
+  `"Cannot process argument transformation on parameter 'Days'. Cannot convert value '<tenant>.onmicrosoft.com' to type 'System.Int32'"`.
+  Child args were built as an array and splatted, but PowerShell array
+  splatting is positional-only — `-Name` tokens inside the array are NOT
+  interpreted as parameter names, so `-DelegatedOrganization` bound
+  to position 0 as a literal string and the tenant value landed on
+  `-Days`. Switched to hashtable splatting for the fixed named args and
+  parse `-ScriptArgs` tokens into the same hashtable so forwarded args
+  bind by name.
+
+### Changed
+
+- `Get-DirectSendReport.ps1` 1.4.0: default `Connect-ExchangeOnline` to
+  `-DisableWAM` so Windows auth goes through the browser instead of the
+  native WAM account picker. The default also avoids the known WAM GDAP
+  token bug (`"The role assigned to user ... isn't supported in this scenario"`).
+  New `-UseWAM` switch opts back in to the WAM broker for cached-SSO
+  scenarios. Ignored on macOS/Linux and on module versions that don't
+  expose `-DisableWAM`.
+- `Run-DirectSendGDAPReports.ps1` 1.2.0: now forwards `-UseWAM` to the
+  child script when the wrapper's `-DisableWAM` is `$false`, so
+  pre-connect and child-script auth stay in sync with the main script's
+  new DisableWAM-by-default behavior.
 
 ## [1.4.0] - 2026-04-23
 
