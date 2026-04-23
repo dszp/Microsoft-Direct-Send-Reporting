@@ -17,3 +17,6 @@ logs/
 
 # Ignore all .txt files as we shouldn't need them in the repo.
 *.txt
+
+# Exclude results/ directory if used by end user for output
+results/
