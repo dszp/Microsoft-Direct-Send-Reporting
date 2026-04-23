@@ -148,10 +148,28 @@ Additional columns (unless `-NoDeepInspect` is used):
 | Field | Description |
 |---|---|
 | `Category` | `SpamLikely` (bracketed-IP hostname like `[127.0.0.1]` — definitive spam signature), `AnonymousExternal` (real hostname — legitimate external service or sophisticated spam), or `InternalRelay` (shown only with `-IncludeInternalRelay`). |
+| `RdsAffected` | `True` / `False` / empty. Whether Reject Direct Send will actually block this specific message. RDS evaluates the **envelope sender** (`ReturnPath`, aka `MAIL FROM`, aka P1 sender), not the `From:` header. A row can have an accepted-domain `From` (and therefore appear in the report) but a subdomain or external `ReturnPath` — in which case RDS doesn't touch it. `True` means RDS will block; `False` means it won't; empty means we couldn't determine (detail lookup failed or ReturnPath missing). |
 | `ConnectorId` | From the Detail event's `Data` XML. Always matches the `\Default ` pattern in results (no configured inbound connector). Rows with custom connector names are excluded before categorization. |
+| `ReturnPath` | The P1 envelope sender from the Detail event's `Data` XML — the actual `MAIL FROM:` address the sender presented at SMTP time. This is what RDS evaluates. A ReturnPath of `billing@servantvoice.com` (bare accepted domain) triggers RDS; `pm_bounces@pmsv-bounces.servantvoice.com` (subdomain of accepted domain, but not itself an accepted domain) does not. Many ESPs (Postmark, SendGrid, Mailgun, Amazon SES) use a custom return-path subdomain as a best-practice bounce-handling mechanism — a convenient side effect is that they bypass RDS automatically without needing an inbound connector. |
 | `ProxiedClientIP` | The pre-EOP source IP from the `CustomData` blob. Usually matches `FromIP`. |
 | `ProxiedClientHostname` | The HELO hostname the sender claimed. `[127.0.0.1]` or other bracketed IP = no valid hostname = classic spam. Real hostname = likely legitimate. Empty = EOP did not classify the connection as anonymous inbound. |
 | `SCL` | Spam Confidence Level (0–9) from the `Spam` event, if one was generated. |
+
+### Why `From` (P2) and `ReturnPath` (P1) can differ — and why it matters
+
+The script's initial candidate filter matches on the `From:` header domain (the P2 sender) being an accepted domain, because that's the visible "sent from us" appearance and all that's available on the primary Get-MessageTraceV2 summary. But Reject Direct Send evaluates the **envelope sender**, which is the P1 `MAIL FROM:` — a separate field that's only visible inside the Detail event's `Data` XML.
+
+These two are the same for basic Direct Send (device → MX, both P1 and P2 are your accepted domain). They differ for ESPs using a custom return-path subdomain:
+
+| ESP / Source | P2 `From:` header | P1 `ReturnPath` | `RdsAffected` |
+|---|---|---|---|
+| A printer via Direct Send | `printer@contoso.com` | `printer@contoso.com` | **True** |
+| Inbound spam spoofing you | `ceo@contoso.com` | `ceo@contoso.com` (spoofed) | **True** |
+| Postmark (custom return-path) | `billing@contoso.com` | `pm_bounces@pmsv-bounces.contoso.com` | **False** |
+| SendGrid default | `notifications@contoso.com` | `bounces.u12345.wl.sendgrid.net` (external) | **False** |
+| Cognito Forms (your-domain config) | `support@contoso.com` | `support@contoso.com` | **True** |
+
+Sort your CSV by `RdsAffected` (or `True` values of it) to see just the rows that actually need an inbound connector. Everything with `RdsAffected = False` is already RDS-safe — no action needed. This is the single most useful column for prioritizing allowlist work.
 
 ## Interpreting the Results
 

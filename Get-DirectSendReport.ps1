@@ -34,6 +34,13 @@
       AnonymousExternal - A real hostname (legitimate mail service or sophisticated
                           spam). Worth a closer look before allowlisting.
 
+    Output also includes RdsAffected (True/False/empty): whether Reject Direct Send
+    will actually block the message. RDS evaluates the P1 envelope sender
+    (ReturnPath), not the P2 header From. ESPs like Postmark/SendGrid that use a
+    custom return-path subdomain (e.g., bounces.yourdomain.com) slide past RDS
+    because subdomains aren't automatically accepted domains. The ReturnPath
+    column surfaces the envelope sender so you can see the pattern directly.
+
     With -IncludeInternalRelay, a third category appears:
       InternalRelay     - ProxiedClientHostname is empty. EOP did not classify the
                           connection as anonymous inbound, so Reject Direct Send will
@@ -551,6 +558,7 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
         $connectorId = ''
         $proxiedClientIP = ''
         $proxiedClientHostname = ''
+        $returnPath = ''
         $scl = $null
         $events = @()
 
@@ -580,6 +588,7 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
                 foreach ($mep in $xml.root.MEP) {
                     switch ($mep.Name) {
                         'ConnectorId' { $connectorId = [string]$mep.String }
+                        'ReturnPath' { $returnPath = [string]$mep.String }
                         'CustomData' {
                             $blob = [string]$mep.Blob
                             if ($blob -match 'ProxiedClientIPAddress=([^;]+)') { $proxiedClientIP = $Matches[1] }
@@ -632,6 +641,19 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
             continue
         }
 
+        # Reject Direct Send evaluates the P1 envelope sender (ReturnPath), not the
+        # P2 header From. ESPs like Postmark, SendGrid, and Mailgun that use a custom
+        # return-path subdomain (e.g., pmsv-bounces.servantvoice.com) slide through
+        # RDS even though their From header is an accepted domain, because the
+        # subdomain isn't itself an accepted domain. Compute RdsAffected honestly
+        # from ReturnPath so users can see which rows are actually at risk vs. which
+        # just *look* at-risk based on the From header filter alone.
+        $returnPathDomain = if ($returnPath -match '@(.+)$') { $Matches[1].ToLower() } else { '' }
+        $rdsAffected = $null
+        if ($returnPathDomain) {
+            $rdsAffected = $domainSet.Contains($returnPathDomain)
+        }
+
         $deepResults.Add([PSCustomObject]@{
             DateTime = $record.DateTime
             From = $record.From
@@ -639,8 +661,10 @@ if (-not $NoDeepInspect -and $allResults.Count -gt 0) {
             Subject = $record.Subject
             Status = $record.Status
             Category = $category
+            RdsAffected = $rdsAffected
             FromIP = $record.FromIP
             ConnectorId = $connectorId
+            ReturnPath = $returnPath
             ProxiedClientIP = $proxiedClientIP
             ProxiedClientHostname = $proxiedClientHostname
             SCL = $scl
@@ -683,11 +707,13 @@ if ($results.Count -gt 0 -and ($results | Get-Member -Name ProxiedClientHostname
     Write-Host 'Top sources (ProxiedClientHostname):' -ForegroundColor Cyan
 
     $grouped = $results | ForEach-Object {
-        # Flatten each row to (hostname, category) so groups are one row per hostname.
+        # Flatten each row to (hostname, category, rdsAffected) so the grouping
+        # can aggregate the actually-RDS-affected count per hostname cluster.
         # Blank hostnames show as "<empty>" for visibility.
         [PSCustomObject]@{
             Hostname = if ([string]::IsNullOrEmpty($_.ProxiedClientHostname)) { '<empty>' } else { $_.ProxiedClientHostname }
             Category = $_.Category
+            RdsAffected = $_.RdsAffected
         }
     } | Group-Object Hostname | Sort-Object Count -Descending
 
@@ -707,10 +733,18 @@ if ($results.Count -gt 0 -and ($results | Get-Member -Name ProxiedClientHostname
             'InternalRelay'     { 'Gray' }
             default             { 'White' }
         }
+        # Count how many rows in this cluster would actually be blocked by RDS
+        # (ReturnPath domain matches an accepted domain). The remainder have a
+        # subdomain or external ReturnPath and slide past RDS automatically.
+        $rdsCount = @($g.Group | Where-Object { $_.RdsAffected -eq $true }).Count
+        $rdsTag = if ($g.Group.Count -eq 0) { '' }
+                  elseif ($rdsCount -eq $g.Group.Count) { '  [RDS blocks all]' }
+                  elseif ($rdsCount -eq 0) { '  [RDS blocks none]' }
+                  else { "  [RDS blocks $rdsCount/$($g.Group.Count)]" }
         $hostDisplay = if ($g.Name.Length -gt $colWidth) { $g.Name.Substring(0, $colWidth - 1) + '…' } else { $g.Name }
         $padded = $hostDisplay.PadRight($colWidth)
         $countStr = $g.Count.ToString().PadLeft(5)
-        Write-Host "  $padded  $countStr  $category" -ForegroundColor $color
+        Write-Host "  $padded  $countStr  $category$rdsTag" -ForegroundColor $color
     }
 
     Write-Host ''
@@ -718,6 +752,8 @@ if ($results.Count -gt 0 -and ($results | Get-Member -Name ProxiedClientHostname
     Write-Host 'Clusters of the same AnonymousExternal hostname often represent a legitimate' -ForegroundColor DarkGray
     Write-Host 'service (signature platform, relay, transactional mail) that will be blocked by' -ForegroundColor DarkGray
     Write-Host 'Reject Direct Send unless an inbound connector is configured with its IPs.' -ForegroundColor DarkGray
+    Write-Host 'The [RDS blocks N/M] tag shows actual impact: ESPs using a custom return-path' -ForegroundColor DarkGray
+    Write-Host 'subdomain (Postmark-style) will show [RDS blocks none] -- no action needed.' -ForegroundColor DarkGray
     Write-Host $bar -ForegroundColor Cyan
 }
 
@@ -772,12 +808,14 @@ if ($OutputPath) {
     $csvAppend = [System.Collections.Generic.List[string]]::new()
     $csvAppend.Add('')
     $csvAppend.Add('"--- SUMMARY ---"')
-    $csvAppend.Add('"Top sources (ProxiedClientHostname)","Count","Category"')
+    $csvAppend.Add('"Top sources (ProxiedClientHostname)","Count","Category","RdsBlocks"')
     if ($grouped) {
         foreach ($g in $grouped) {
             $cat = ($g.Group | Select-Object -First 1).Category
+            $rdsCount = @($g.Group | Where-Object { $_.RdsAffected -eq $true }).Count
+            $rdsBlocks = "$rdsCount/$($g.Group.Count)"
             $name = $g.Name -replace '"', '""'
-            $csvAppend.Add('"' + $name + '","' + $g.Count + '","' + $cat + '"')
+            $csvAppend.Add('"' + $name + '","' + $g.Count + '","' + $cat + '","' + $rdsBlocks + '"')
         }
     }
     $csvAppend.Add('')
