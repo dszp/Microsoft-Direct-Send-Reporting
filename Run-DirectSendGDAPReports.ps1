@@ -56,9 +56,14 @@
     ./Run-DirectSendGDAPReports.ps1 -Tenants agmaasindy.onmicrosoft.com,contoso.onmicrosoft.com -MaxParallel 3 -ScriptArgs @('-Days','30')
 
 .NOTES
-    Version: 1.0.0
+    Version: 1.0.1
 
     Changelog:
+      1.0.1 (2026-04-23) - Fix -MaxParallel throttle. The check was inspecting
+                           $_.State on the wrapper object (no such property),
+                           so it always evaluated to zero running jobs and
+                           every tenant's Connect-ExchangeOnline prompt
+                           opened at once. Now checks $_.Job.State.
       1.0.0 (2026-04-23) - Initial release. Parallel fan-out wrapper around
                            Get-DirectSendReport.ps1 for partners auditing
                            multiple GDAP-delegated customer tenants. Uses
@@ -182,11 +187,12 @@ foreach ($tenant in $Tenants) {
         }
     }
 
-    # Throttle: wait until we have a free slot.
-    while (($jobs | Where-Object { $_.State -eq 'Running' }).Count -ge $MaxParallel) {
+    # Throttle: wait until we have a free slot. The wrapper objects don't have
+    # a .State property -- the Job object does, so look at $_.Job.State.
+    while (($jobs | Where-Object { $_.Job.State -eq 'Running' }).Count -ge $MaxParallel) {
         Start-Sleep -Seconds 2
         # Drain any finished jobs so the log shows progress promptly.
-        foreach ($done in $jobs | Where-Object { $_.State -ne 'Running' -and -not $_.HasBeenReported }) {
+        foreach ($done in $jobs | Where-Object { $_.Job.State -ne 'Running' -and -not $_.HasBeenReported }) {
             Write-Host "----- [$($done.Tenant)] finished with state $($done.Job.State) -----" -ForegroundColor Yellow
             $done | Add-Member -NotePropertyName HasBeenReported -NotePropertyValue $true -Force
         }

@@ -10,9 +10,19 @@ script's `.NOTES` block. The repo-level version below tracks the highest
 notable change across both. Current component versions:
 
 - `Get-DirectSendReport.ps1` — **1.3.0** (core auditor)
-- `Run-DirectSendGDAPReports.ps1` — **1.0.0** (parallel GDAP fan-out wrapper)
+- `Run-DirectSendGDAPReports.ps1` — **1.0.1** (parallel GDAP fan-out wrapper)
 
 ## [Unreleased]
+
+## [1.3.1] - 2026-04-23
+
+### Fixed
+
+- `Run-DirectSendGDAPReports.ps1` 1.0.1: the `-MaxParallel` throttle was
+  inspecting `$_.State` on the wrapper objects rather than `$_.Job.State`,
+  so the running-count always evaluated to zero and every tenant's
+  `Connect-ExchangeOnline` browser prompt opened at once. Now correctly
+  limits concurrent jobs to `-MaxParallel`.
 
 ## [1.3.0] - 2026-04-23
 
