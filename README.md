@@ -27,6 +27,12 @@ PowerShell script to audit emails delivered via Microsoft Direct Send in an Exch
   - [Example: allowlisting a SendGrid-based vendor](#example-allowlisting-a-sendgrid-based-vendor-eg-service-titan)
   - [Example: allowlisting a vendor with a dedicated cert](#example-allowlisting-a-vendor-with-a-dedicated-cert)
   - [Example: allowlisting by IP only](#example-allowlisting-by-ip-only)
+  - [Helper script: `New-Exchange365-InboundConnectorByIPRanges.ps1`](#helper-script-new-exchange365-inboundconnectorbyiprangesps1)
+    - [When to use it](#when-to-use-it)
+    - [Strict vs Permissive posture](#strict-vs-permissive-posture)
+    - [Auto-populating `-SenderDomains` (Strict only)](#auto-populating--senderdomains-strict-only)
+    - [Pre-create overlap check](#pre-create-overlap-check)
+    - [Subdomain return-path blind spot](#subdomain-return-path-blind-spot)
   - [Allowlisting multiple email providers](#allowlisting-multiple-email-providers-sendgrid-mailgun-postmark-etc)
   - [IMPORTANT: DMARC must be enforced](#important-dmarc-must-be-enforced)
   - [Verifying a connector matches correctly](#verifying-a-connector-matches-correctly)
@@ -386,7 +392,7 @@ New-InboundConnector `
 
 ### Example: allowlisting by IP only
 
-When TLS cert matching isn't viable:
+When TLS cert matching isn't viable — typically because the vendor's TLS cert subject isn't published, rotates, or doesn't match a stable wildcard, but the vendor *does* publish a fixed list of sending CIDR ranges (commonly via SPF) — fall back to an IP-only connector:
 
 ```powershell
 New-InboundConnector `
@@ -398,6 +404,75 @@ New-InboundConnector `
     -RequireTls $true `
     -Enabled $true
 ```
+
+### Helper script: `New-Exchange365-InboundConnectorByIPRanges.ps1`
+
+This repo includes a PowerShell helper that creates the IP-only connector for you, with a few important conveniences over typing `New-InboundConnector` by hand.
+
+#### When to use it
+
+Reach for this script when:
+
+- The vendor's TLS certificate subject is unknown, undocumented, or rotates often, but their **sending IP ranges are published** (typically via their SPF record or vendor documentation), so a TLS-cert connector isn't viable; **and**
+- One or more of those CIDR ranges has a prefix shorter than `/24` (e.g. SMTP.com lists `192.40.160.0/19` and `74.91.80.0/20` in their SPF). Exchange Online's `-SenderIPAddresses` only honors entries of `/24` or smaller in practice — a `/19` has to be expanded into 32 contiguous `/24` blocks before the connector will actually match traffic from those IPs. The script automates that expansion.
+
+Minimum invocation:
+
+```powershell
+.\New-Exchange365-InboundConnectorByIPRanges.ps1 `
+    -ServiceName 'SMTP.com' `
+    -CidrRanges '192.40.160.0/19','74.91.80.0/20'
+```
+
+Other niceties: `-DelegatedOrganization` for GDAP, `-WhatIf` for a dry-run, the same `-DisableWAM`-by-default Windows auth flow as the audit script, and an inline "Known service IP ranges" reference block at the top of the file (currently SMTP.com) with a template for adding more services.
+
+#### Strict vs Permissive posture
+
+The script can create the connector in either of two configurations, selected by `-Posture`. Both successfully exempt the vendor's mail from Reject Direct Send (which is the audit's primary goal). They differ in connector-layer anti-spoofing:
+
+| | **Permissive** (default) | **Strict** |
+|---|---|---|
+| Underlying flag | `-RestrictDomainsToIPAddresses $false` | `-RestrictDomainsToIPAddresses $true` |
+| `-SenderDomains` value | `'*'` | Explicit list (your accepted domains) |
+| What the IP list does | Identifies the partner: only mail from these IPs matches the connector | Filters mail already claimed by `-SenderDomains`: must come from these IPs or be rejected |
+| Behavior for spoofed-domain mail from other IPs | Doesn't match this connector — falls through to normal EOP / Reject Direct Send / SPF / DMARC | Rejected at SMTP time by this connector |
+| Maintenance burden | None — connector covers all current and future accepted domains automatically | Must update `-SenderDomains` (or recreate) every time a new accepted domain is onboarded |
+| EAC radio button | "By verifying that the IP address of the sending server matches" | "By verifying that the sender domain matches one of the following domains" + "Reject messages if they don't come from within these IP address ranges" |
+
+Permissive is the default because it's the simpler posture and most operators rely on Reject Direct Send + SPF/DMARC for spoofing defense anyway. Pick Strict when you want belt-and-suspenders connector-layer rejection of impersonation attempts:
+
+```powershell
+# Permissive (default) -- IP-based identification, no domain rejection
+.\New-Exchange365-InboundConnectorByIPRanges.ps1 `
+    -ServiceName 'SMTP.com' `
+    -CidrRanges '192.40.160.0/19','74.91.80.0/20'
+
+# Strict -- IP enforcement filter on accepted-domain matches
+.\New-Exchange365-InboundConnectorByIPRanges.ps1 `
+    -ServiceName 'SMTP.com' `
+    -CidrRanges '192.40.160.0/19','74.91.80.0/20' `
+    -Posture Strict
+```
+
+The script refuses `-SenderDomains '*'` in Strict posture — that combination tells Exchange to reject every external sender that does not come from the allowlisted IPs, which breaks normal MX flow ([CRITICAL warning](#critical--senderdomains-must-be-your-specific-accepted-domains)).
+
+#### Auto-populating `-SenderDomains` (Strict only)
+
+In Strict posture, if you omit `-SenderDomains`, the script calls `Get-AcceptedDomain` after connecting and uses every accepted domain in the tenant *except* `*.onmicrosoft.com` routing domains (`tenant.onmicrosoft.com` and `tenant.mail.onmicrosoft.com` are filtered out automatically). The resulting list is logged before the connector is created so you can confirm what was selected. Pass an explicit list (e.g. `-SenderDomains 'contoso.com','contoso.net'`) when you want a narrower scope — explicit values always override the auto-population.
+
+In Permissive posture, `-SenderDomains` defaults to `'*'` (the IP list is the security boundary, so a wildcard is correct) and explicit values are still accepted if you want to scope the connector further.
+
+#### Pre-create overlap check
+
+Before creating the connector the script enumerates existing IP-restricted inbound connectors with `Get-InboundConnector`, computes their `/24` coverage, and compares it against the proposed ranges. If any existing connector already covers some of the same `/24` blocks, the script warns with the existing connector's name, lists how many `/24` blocks overlap, and prompts before continuing.
+
+The recommended response is to abort, review the overlapping connector with `Get-InboundConnector | Format-List Name,Enabled,SenderIPAddresses,SenderDomains,Comment`, decide whether the existing one should be kept or removed (`Remove-InboundConnector -Identity <name>`), then re-run. Pass `-Force` to skip the prompt or `-SkipOverlapCheck` to skip the check entirely.
+
+#### Subdomain return-path blind spot
+
+Exchange's `-SenderDomains` matching is **not** recursive. `contoso.com` matches mail with envelope sender exactly in `contoso.com`, not `bounces.contoso.com` or any other subdomain. ESPs that use a custom bounce subdomain (SendGrid/Postmark with `bounces.<yourdomain>`, etc.) therefore slide past a Strict-posture connector keyed on root accepted domains entirely — it does not apply to them, and they continue through normal EOP flow without being blocked or rejected.
+
+That is the same blind spot Reject Direct Send has, and is exactly why `Get-DirectSendReport.ps1` surfaces the P1 envelope `ReturnPath` domain in its summary: that column tells you which providers will not be covered by an accepted-domain-keyed connector. (Permissive-posture connectors are not affected — they identify by IP, not domain.)
 
 ### Allowlisting multiple email providers (SendGrid, Mailgun, Postmark, etc.)
 

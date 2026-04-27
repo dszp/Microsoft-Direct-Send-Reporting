@@ -11,8 +11,51 @@ notable change across both. Current component versions:
 
 - `Get-DirectSendReport.ps1` — **1.5.1** (core auditor)
 - `Run-DirectSendGDAPReports.ps1` — **1.3.0** (parallel GDAP fan-out wrapper)
+- `New-Exchange365-InboundConnectorByIPRanges.ps1` — **1.0.0** (IP-allowlist inbound connector helper)
 
-## [Unreleased]
+## [1.7.0] - 2026-04-27
+
+### Added
+
+- `New-Exchange365-InboundConnectorByIPRanges.ps1` 1.0.0: new helper for the
+  remediation step after the audit. Creates an Exchange Online inbound
+  connector that allowlists a third-party sending service by IP, expanding
+  any input CIDR larger than /24 into the equivalent set of /24 blocks first
+  (Exchange Online only honors /24-or-smaller entries in
+  `-SenderIPAddresses` in practice). Generalizes the previously SMTP.com-
+  hardcoded scratch script into a reusable tool: `-ServiceName`,
+  `-CidrRanges`, `-SenderDomains`, `-Name`, `-Comment`, `-ConnectorType`,
+  `-RequireTls`, `-Posture` (Strict | Permissive), `-DelegatedOrganization`,
+  `-UseWAM`, `-NoDisconnect`, `-SkipOverlapCheck`, and `-Force` parameters;
+  `SupportsShouldProcess` for `-WhatIf` dry-runs. Two postures supported,
+  selected via `-Posture`:
+  - **Permissive** (default) — `-RestrictDomainsToIPAddresses $false` with
+    `-SenderDomains '*'`. The IP list is the partner *identification*
+    mechanism: only mail from those IPs matches the connector, everything
+    else falls through to normal EOP / Reject Direct Send / SPF / DMARC.
+    Matches the EAC radio "By verifying that the IP address of the
+    sending server matches".
+  - **Strict** — `-RestrictDomainsToIPAddresses $true` with an explicit
+    `-SenderDomains` list. The IP list is enforced as a *filter* on
+    `-SenderDomains`-matched mail: spoofed-domain mail from other IPs is
+    rejected at SMTP time. When `-SenderDomains` is omitted in Strict
+    posture, the script auto-populates from `Get-AcceptedDomain` (every
+    accepted domain in the tenant except `*.onmicrosoft.com` routing
+    domains). `'*'` is rejected outright in Strict posture because that
+    combination would block all external mail not from the allowlisted
+    IPs and break normal MX flow.
+
+  Pre-create overlap check enumerates existing IP-restricted inbound
+  connectors via `Get-InboundConnector`, computes their /24 coverage, and
+  warns plus prompts when the proposed ranges overlap an existing
+  connector so the same IPs are not allowlisted under two different
+  connector names; `-Force` skips the prompt and `-SkipOverlapCheck`
+  skips the check entirely. Defaults `Connect-ExchangeOnline` to
+  `-DisableWAM` (matching `Get-DirectSendReport.ps1` 1.4.0) so Windows
+  auth uses the browser flow and avoids the WAM GDAP token bug. Includes
+  an inline "Known service IP ranges" reference block documenting the
+  SMTP.com ranges and source URL, with a template for adding more
+  services.
 
 ## [1.6.1] - 2026-04-23
 
